@@ -4760,6 +4760,8 @@ static void MaybeShowDiagnosticSummary()
         classification = L"SYSTEMIC: monitor and window pipelines delivered no FrameArrived frame; inspect WGC/device/session/environment.";
     else if (g_monitorProbe.firstFrameReceived && !g_controlWindowProbe.firstFrameReceived)
         classification = L"WINDOW-SPECIFIC: monitor control works, but the unparked control window did not deliver a frame.";
+    else if (windowEvents > 0 && callbackFirstFrames == 0)
+        classification = L"CALLBACK-EMPTY: FrameArrived fires, but sender.TryGetNextFrame does not return a valid frame.";
     else if (g_controlWindowProbe.firstFrameReceived && callbackFirstFrames == 0)
         classification = L"NORMAL-LIFECYCLE: unparked control works, but normal sessions do not; compare parking/session ownership.";
     else if (callbackFirstFrames > 0 && uiFrames == 0)
