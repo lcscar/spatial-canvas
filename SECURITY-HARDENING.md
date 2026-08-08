@@ -8,7 +8,9 @@ This branch is intentionally conservative. The goal is to preserve Spatial Canva
 - No HTTP/HTTPS update check and no WinINet dependency in the hardened source.
 - No autostart persistence and no HKCU `Run` registry read/write path.
 - No local named-pipe server.
+- No screenshot or captured-frame export/persistence path.
 - Crash recovery does not persist window titles; the recovery file keeps only the data needed to identify/restore window geometry while preserving the existing file format.
+- A privacy-safe UTF-8 debug log is written beside the executable. It records HWND/process/class metadata and errors, but never window-title text, document names, URLs, screenshots, or frame content.
 - No new telemetry is introduced.
 - No new services, drivers, scheduled tasks, DLL injection, process injection, or global keyboard hooks are introduced.
 

@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "Canvas.h"
+#include "Diagnostics.h"
+#include "WindowDiscovery.h"
 #include <windowsx.h>
 #include <d3dcompiler.h>
 #include <d2d1.h>
@@ -105,6 +107,10 @@ struct Tile
     bool pinnedFlag = false; // M22: ekrana sabit (pan/zoom'u yok sayar)
     float px = 0, py = 0, pw = 0, ph = 0; // M22: ekran-uzayı rect (client)
     bool vis = true;         // M73: aktif tuvalde görünür mü (runtime; SwitchSpace hesaplar)
+    ULONGLONG captureStartedTick = 0;
+    ULONGLONG firstFrameTick = 0;
+    size_t frameCount = 0;
+    bool noFrameWarningLogged = false;
     // M73 Slice 2: pencerenin bulunduğu tuvallar + her tuvaldeki yerleşimi. Anahtar
     // seti = üyelik (paylaşımlı). t.wx/wy/pin/px.. = AKTİF tuvalin hydrate kopyası.
     std::unordered_map<int, Place> places;
@@ -179,10 +185,28 @@ namespace
     winrt::com_ptr<IDWriteTextFormat> g_textFmtN;  // M44: not metni (sol-üst hizalı, satır kaydırmalı)
     // M5: ayarlar paneli
     Settings g_set;
-    // Corporate-safe diagnostic counters: counts/HRESULT only, never window titles/content.
-    size_t g_diagEligibleWindows = 0;
-    int g_diagCaptureFailures = 0;
-    HRESULT g_diagFirstCaptureHr = S_OK;
+    // Privacy-safe discovery/capture diagnostics. Window titles/content are never logged.
+    struct DiscoveryDiagnostics
+    {
+        size_t enumWindowsCallbacks = 0;
+        size_t enumDesktopCallbacks = 0;
+        size_t uniqueWindows = 0;
+        size_t structurallySkipped = 0;
+        size_t candidates = 0;
+        size_t attempts = 0;
+        size_t capturesStarted = 0;
+        size_t captureFailures = 0;
+        size_t userRuleSkipped = 0;
+        BOOL enumWindowsResult = FALSE;
+        DWORD enumWindowsError = ERROR_SUCCESS;
+        BOOL enumDesktopResult = FALSE;
+        DWORD enumDesktopError = ERROR_SUCCESS;
+        bool desktopFallbackUsed = false;
+        HRESULT firstCaptureHr = S_OK;
+    } g_diag;
+    ULONGLONG g_captureStartupTick = 0;
+    bool g_noFrameNoticeShown = false;
+    size_t g_captureAttemptSequence = 0;
     bool g_panelOpen = false;
     float g_panelA = 0.0f;          // 0 kapalı, 1 açık (animasyonlu)
     constexpr float PANEL_W = 320.0f;
@@ -352,7 +376,6 @@ namespace
     std::mutex g_updateMutex;
     bool g_updateAvail = false;                // M48: kalıcı HUD ipucu için
     D2D1_RECT_F g_updateRect{};                // M51: pill hit-test (tıkla=release aç)
-    bool g_pngRequest = false;                 // M52: tuvali PNG'ye aktar isteği (Render'da işlenir)
     // M50: oturum görünüm restore (settings'ten yüklenen son kamera)
     float g_loadCamX = 0, g_loadCamY = 0, g_loadCamZ = 0;
     bool g_hasSavedCam = false;
@@ -554,35 +577,196 @@ static winrt::IDirect3DDevice CreateWinrtDevice(winrt::com_ptr<ID3D11Device> con
     return insp.as<winrt::IDirect3DDevice>();
 }
 
-// ---- Pencere numaralandırma ----
+// ---- Broad top-level window discovery ----
+// Compatibility is determined by the capture attempt, not by application/framework
+// prediction. Only invalid/non-top-level/invisible/self/desktop-shell HWNDs are skipped.
+struct EnumerationContext
+{
+    std::vector<HWND> windows;
+    std::unordered_set<HWND> seen;
+    DiscoveryDiagnostics diagnostics;
+    bool desktopPass = false;
+    bool logEachWindow = false;
+};
+
+static std::wstring ProcessNameOf(DWORD pid, DWORD& error)
+{
+    error = ERROR_SUCCESS;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+    {
+        error = GetLastError();
+        return L"<unavailable>";
+    }
+    std::vector<wchar_t> path(512);
+    DWORD length = static_cast<DWORD>(path.size());
+    if (!QueryFullProcessImageNameW(process, 0, path.data(), &length))
+    {
+        error = GetLastError();
+        CloseHandle(process);
+        return L"<unavailable>";
+    }
+    CloseHandle(process);
+    std::wstring full(path.data(), length);
+    size_t slash = full.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? full : full.substr(slash + 1);
+}
+
 static BOOL CALLBACK EnumCb(HWND hwnd, LPARAM lp)
 {
-    auto* out = reinterpret_cast<std::vector<HWND>*>(lp);
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return TRUE;
-    LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-    if (ex & WS_EX_TOOLWINDOW) return TRUE;
-    if (GetWindow(hwnd, GW_OWNER)) return TRUE; // sahipli (dialog/popup) dışla
-    wchar_t title[256];
-    if (GetWindowTextW(hwnd, title, 256) == 0) return TRUE;
+    auto* context = reinterpret_cast<EnumerationContext*>(lp);
+    if (context->desktopPass) ++context->diagnostics.enumDesktopCallbacks;
+    else ++context->diagnostics.enumWindowsCallbacks;
+
+    if (!context->seen.insert(hwnd).second) return TRUE;
+    ++context->diagnostics.uniqueWindows;
+
+    spatial::discovery::WindowFacts facts;
+    facts.isWindow = IsWindow(hwnd) != FALSE;
+    facts.visible = IsWindowVisible(hwnd) != FALSE;
+    facts.topLevel = GetAncestor(hwnd, GA_ROOT) == hwnd;
+    GetWindowThreadProcessId(hwnd, &facts.processId);
+    wchar_t className[256]{};
+    int classLength = GetClassNameW(hwnd, className, ARRAYSIZE(className));
+    if (classLength > 0) facts.className.assign(className, classLength);
+
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    HWND owner = GetWindow(hwnd, GW_OWNER);
+    int titleLength = GetWindowTextLengthW(hwnd);
+    RECT rect{};
+    BOOL rectOk = GetWindowRect(hwnd, &rect);
+    DWORD rectError = rectOk ? ERROR_SUCCESS : GetLastError();
     DWORD cloaked = 0;
-    DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-    if (cloaked) return TRUE;
-    RECT r{}; GetWindowRect(hwnd, &r);
-    if (r.right - r.left < 300 || r.bottom - r.top < 200) return TRUE;
-    DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == GetCurrentProcessId()) return TRUE;
-    wchar_t cls[128]; GetClassNameW(hwnd, cls, 128);
-    if (!wcscmp(cls, L"SpatialCanvasWnd")) return TRUE; // M16: kendi tuvalimiz (ikinci örnek dahil)
-    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW")) return TRUE;
-    if (!wcscmp(cls, L"ApplicationFrameWindow")) return TRUE; // UWP: park/restore guvenilmez
-    out->push_back(hwnd);
+    HRESULT cloakHr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    DWORD processError = ERROR_SUCCESS;
+    std::wstring processName = facts.processId ? ProcessNameOf(facts.processId, processError) : L"<unknown>";
+
+    auto decision = spatial::discovery::EvaluateWindow(facts, GetCurrentProcessId());
+    if (decision == spatial::discovery::WindowDecision::Candidate)
+    {
+        context->windows.push_back(hwnd);
+        ++context->diagnostics.candidates;
+    }
+    else
+    {
+        ++context->diagnostics.structurallySkipped;
+    }
+
+    if (context->logEachWindow)
+    {
+        std::wstring message = L"hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
+            L" pid=" + std::to_wstring(facts.processId) +
+            L" process=" + processName +
+            L" process_query_error=" + std::to_wstring(processError) +
+            L" class=" + (facts.className.empty() ? L"<unavailable>" : facts.className) +
+            L" is_window=" + (facts.isWindow ? L"true" : L"false") +
+            L" visible=" + (facts.visible ? L"true" : L"false") +
+            L" top_level=" + (facts.topLevel ? L"true" : L"false") +
+            L" minimized=" + (IsIconic(hwnd) ? L"true" : L"false") +
+            L" maximized=" + (IsZoomed(hwnd) ? L"true" : L"false") +
+            L" has_title=" + (titleLength > 0 ? L"true" : L"false") +
+            L" title_length=" + std::to_wstring(std::max(titleLength, 0)) +
+            L" owner=" + spatial::diagnostics::HexHandle(owner) +
+            L" ex_style=0x";
+        wchar_t styleValue[32]{};
+        swprintf_s(styleValue, L"%llX", static_cast<unsigned long long>(exStyle));
+        message += styleValue;
+        message += std::wstring(L" tool_window=") +
+            ((exStyle & WS_EX_TOOLWINDOW) ? L"true" : L"false");
+        message += L" cloaked=" + std::wstring(SUCCEEDED(cloakHr) && cloaked ? L"true" : L"false");
+        message += L" cloak_hresult=" + spatial::diagnostics::HexHRESULT(cloakHr);
+        if (rectOk)
+            message += L" bounds=" + std::to_wstring(rect.left) + L"," + std::to_wstring(rect.top) +
+                L"," + std::to_wstring(rect.right - rect.left) + L"x" +
+                std::to_wstring(rect.bottom - rect.top);
+        else
+            message += L" bounds=<unavailable> bounds_error=" + std::to_wstring(rectError);
+        message += L" decision=" + std::wstring(spatial::discovery::WindowDecisionName(decision));
+        spatial::diagnostics::Log(L"enumeration.window", message);
+    }
     return TRUE;
+}
+
+static EnumerationContext EnumerateCaptureCandidates(bool logEachWindow)
+{
+    EnumerationContext context;
+    context.logEachWindow = logEachWindow;
+
+    SetLastError(ERROR_SUCCESS);
+    context.diagnostics.enumWindowsResult =
+        EnumWindows(EnumCb, reinterpret_cast<LPARAM>(&context));
+    context.diagnostics.enumWindowsError =
+        context.diagnostics.enumWindowsResult ? ERROR_SUCCESS : GetLastError();
+
+    // EnumDesktopWindows is a diagnostic/robustness fallback on the thread's
+    // current desktop. De-duplication prevents duplicate capture attempts.
+    if (!context.diagnostics.enumWindowsResult ||
+        context.diagnostics.enumWindowsCallbacks == 0 || context.windows.empty())
+    {
+        context.diagnostics.desktopFallbackUsed = true;
+        context.desktopPass = true;
+        HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+        if (desktop)
+        {
+            spatial::diagnostics::Log(L"enumeration.fallback",
+                L"calling EnumDesktopWindows on GetThreadDesktop result");
+            SetLastError(ERROR_SUCCESS);
+            context.diagnostics.enumDesktopResult = EnumDesktopWindows(
+                desktop, EnumCb, reinterpret_cast<LPARAM>(&context));
+            context.diagnostics.enumDesktopError = context.diagnostics.enumDesktopResult ?
+                ERROR_SUCCESS : GetLastError();
+        }
+        else
+        {
+            context.diagnostics.enumDesktopResult = FALSE;
+            context.diagnostics.enumDesktopError = GetLastError();
+        }
+
+        // If the thread desktop had no candidates, ask the OS for the current
+        // interactive input desktop. OpenInputDesktop remains permission-bound;
+        // failure is logged and never bypassed.
+        if (context.windows.empty())
+        {
+            SetLastError(ERROR_SUCCESS);
+            HDESK inputDesktop = OpenInputDesktop(0, FALSE,
+                DESKTOP_ENUMERATE | DESKTOP_READOBJECTS);
+            DWORD openError = inputDesktop ? ERROR_SUCCESS : GetLastError();
+            spatial::diagnostics::Log(L"enumeration.input_desktop",
+                L"OpenInputDesktop result=" + std::wstring(inputDesktop ? L"success" : L"failure") +
+                L" Win32Error=" + std::to_wstring(openError));
+            if (inputDesktop)
+            {
+                SetLastError(ERROR_SUCCESS);
+                BOOL inputResult = EnumDesktopWindows(
+                    inputDesktop, EnumCb, reinterpret_cast<LPARAM>(&context));
+                DWORD inputError = inputResult ? ERROR_SUCCESS : GetLastError();
+                spatial::diagnostics::Log(L"enumeration.input_desktop",
+                    L"EnumDesktopWindows result=" + std::wstring(inputResult ? L"true" : L"false") +
+                    L" Win32Error=" + std::to_wstring(inputError));
+                CloseDesktop(inputDesktop);
+            }
+        }
+    }
+
+    std::wstring aggregate =
+        L"EnumWindows_result=" + std::wstring(context.diagnostics.enumWindowsResult ? L"true" : L"false") +
+        L" EnumWindows_error=" + std::to_wstring(context.diagnostics.enumWindowsError) +
+        L" EnumWindows_callbacks=" + std::to_wstring(context.diagnostics.enumWindowsCallbacks) +
+        L" fallback_used=" + (context.diagnostics.desktopFallbackUsed ? L"true" : L"false") +
+        L" EnumDesktopWindows_result=" + std::wstring(context.diagnostics.enumDesktopResult ? L"true" : L"false") +
+        L" EnumDesktopWindows_error=" + std::to_wstring(context.diagnostics.enumDesktopError) +
+        L" EnumDesktopWindows_callbacks=" + std::to_wstring(context.diagnostics.enumDesktopCallbacks) +
+        L" unique_windows=" + std::to_wstring(context.diagnostics.uniqueWindows) +
+        L" structural_skips=" + std::to_wstring(context.diagnostics.structurallySkipped) +
+        L" candidates=" + std::to_wstring(context.diagnostics.candidates);
+    spatial::diagnostics::Log(L"enumeration.summary", aggregate);
+    return context;
 }
 
 // ---- D3D kurulum ----
 static void InitD3D()
 {
+    spatial::diagnostics::Log(L"render.init", L"stage=D3D11CreateDevice begin");
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
         nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
@@ -649,11 +833,13 @@ static void InitD3D()
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
     winrt::check_hresult(g_device->CreateRasterizerState(&rd, g_raster.put()));
+    spatial::diagnostics::Log(L"render.init", L"D3D11 device, swap chain, shaders, and render target ready");
 }
 
 // ---- M4: D2D/DWrite overlay kurulumu ----
 static void InitD2D()
 {
+    spatial::diagnostics::Log(L"render.overlay", L"initializing D2D/DWrite overlay");
     try
     {
         winrt::check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
@@ -731,8 +917,21 @@ static void InitD2D()
         g_textFmtN->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         g_textFmtN->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         g_textFmtN->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        spatial::diagnostics::Log(L"render.overlay", L"D2D/DWrite overlay ready");
     }
-    catch (...) { g_d2dRT = nullptr; } // overlay süs - olmazsa app yine yaşar
+    catch (winrt::hresult_error const& e)
+    {
+        spatial::diagnostics::Log(L"render.overlay",
+            L"initialization failed HRESULT=" + spatial::diagnostics::HexHRESULT(e.code()) +
+            L" action=continue_without_overlay");
+        g_d2dRT = nullptr;
+    }
+    catch (...)
+    {
+        spatial::diagnostics::Log(L"render.overlay",
+            L"initialization failed HRESULT=0x80004005 action=continue_without_overlay");
+        g_d2dRT = nullptr;
+    } // overlay süs - olmazsa app yine yaşar
 }
 
 // ---- M8: Tuval alanı CANLI uygulanır (yeniden başlatma yok) ----
@@ -1976,7 +2175,6 @@ static void DrawOverlay()
             L"Ctrl+G:  pencereleri ızgaraya diz\n"
             L"Ctrl+Shift+N:  yapışkan not (Tab=renk)\n"
             L"Ctrl+Shift+Z:  bölge çerçevesi (başlıktan sürükle)\n"
-            L"Ctrl+Shift+S:  tuvali PNG'ye aktar\n"
             L"Ctrl+Shift+D:  odak modu (gerisini soluklat)\n"
             L"Delete:  seçilileri / hover'daki not-bölgeyi çıkar\n"
             L"Ctrl+Z:  son silinen not/bölge/bağlayıcıyı geri al\n"
@@ -1995,7 +2193,6 @@ static void DrawOverlay()
             L"Ctrl+G:  arrange windows into grid\n"
             L"Ctrl+Shift+N:  sticky note (Tab=color)\n"
             L"Ctrl+Shift+Z:  zone frame (drag the title bar)\n"
-            L"Ctrl+Shift+S:  export canvas to PNG\n"
             L"Ctrl+Shift+D:  focus mode (dim the rest)\n"
             L"Delete:  remove selected / hovered note-zone\n"
             L"Ctrl+Z:  undo last note/zone/link delete\n"
@@ -2914,8 +3111,12 @@ static bool ExecuteBoundAction(int vk, int mods)
     return false;
 }
 
-static bool AddTile(HWND hwnd)
+static spatial::discovery::AttemptResult AddTileCore(HWND hwnd)
 {
+    const size_t attemptNumber = ++g_captureAttemptSequence;
+    const std::wstring hwndText = spatial::diagnostics::HexHandle(hwnd);
+    spatial::diagnostics::Log(L"capture.attempt",
+        L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText + L" stage=inspect");
     Tile t;
     t.source = hwnd;
     t.exe = ExeNameOf(hwnd);
@@ -2923,7 +3124,13 @@ static bool AddTile(HWND hwnd)
     {
         std::wstring exeL = t.exe;
         std::transform(exeL.begin(), exeL.end(), exeL.begin(), ::towlower);
-        if (g_ruleExclude.count(exeL)) return false;
+        if (g_ruleExclude.count(exeL))
+        {
+            spatial::diagnostics::Log(L"capture.skip",
+                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+                L" reason=user_rules_exclude process=" + t.exe);
+            return { spatial::discovery::AttemptStatus::Skipped, S_OK };
+        }
         auto oit = g_ruleOpacity.find(exeL); // M28: saydamlık kuralı
         if (oit != g_ruleOpacity.end()) t.opacity = oit->second;
         auto bit = g_ruleBlur.find(exeL);    // M34: blur kuralı
@@ -2935,35 +3142,101 @@ static bool AddTile(HWND hwnd)
         (PDWORD_PTR)&t.icon);
     if (!t.icon) t.icon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICON);
     if (!t.icon) t.icon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICONSM);
+    std::wstring captureStage = L"GraphicsCaptureItem.CreateForWindow";
     try
     {
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=" + captureStage);
         t.item = CreateItemForWindow(hwnd);
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=GraphicsCaptureItem.CreateForWindow result=success");
         t.lastSize = t.item.Size();
+        if (t.lastSize.Width <= 0 || t.lastSize.Height <= 0)
+            winrt::throw_hresult(E_INVALIDARG);
+        captureStage = L"Direct3D11CaptureFramePool.CreateFreeThreaded";
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" item_size=" + std::to_wstring(t.lastSize.Width) + L"x" +
+            std::to_wstring(t.lastSize.Height) + L" stage=" + captureStage);
         t.pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
             g_winrtDevice, winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2, t.lastSize);
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=Direct3D11CaptureFramePool.CreateFreeThreaded result=success");
+        captureStage = L"CaptureFramePool.CreateCaptureSession";
         t.session = t.pool.CreateCaptureSession(t.item);
-        try { t.session.IsCursorCaptureEnabled(false); } catch (...) {}
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=CaptureFramePool.CreateCaptureSession result=success");
+        try
+        {
+            t.session.IsCursorCaptureEnabled(false);
+            spatial::diagnostics::Log(L"capture.option",
+                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+                L" IsCursorCaptureEnabled(false)=success");
+        }
+        catch (winrt::hresult_error const& e)
+        {
+            spatial::diagnostics::Log(L"capture.option",
+                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+                L" IsCursorCaptureEnabled(false)=ignored_failure HRESULT=" +
+                spatial::diagnostics::HexHRESULT(e.code()));
+        }
+        catch (...)
+        {
+            spatial::diagnostics::Log(L"capture.option",
+                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+                L" IsCursorCaptureEnabled(false)=ignored_failure HRESULT=0x80004005");
+        }
         // NOT: M16'da eklenen IsBorderRequired(false)+IncludeSecondaryWindows(true)
         // KALDIRILDI - tile'ları siyah bırakıyordu. IsBorderRequired bazı Win
         // sürümlerinde capture'ı bozuyor (openai/codex #25178); RequestAccessAsync
         // (Borderless) manifest capability + consent ister, bizde yok. Sarı yakalama
         // çerçevesi (kozmetik) geri geldi - capture'ın çalışmasından önemsiz.
         // M4: yakalamayı sınırla (varsayılan 30fps - ayarlardan değişir)
-        try { t.session.MinUpdateInterval(winrt::TimeSpan{ std::chrono::milliseconds(1000 / std::max(1, g_set.fpsCap)) }); } catch (...) {}
+        try
+        {
+            t.session.MinUpdateInterval(winrt::TimeSpan{
+                std::chrono::milliseconds(1000 / std::max(1, g_set.fpsCap)) });
+        }
+        catch (winrt::hresult_error const& e)
+        {
+            spatial::diagnostics::Log(L"capture.option",
+                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+                L" MinUpdateInterval=ignored_failure HRESULT=" +
+                spatial::diagnostics::HexHRESULT(e.code()));
+        }
+        catch (...)
+        {
+            spatial::diagnostics::Log(L"capture.option",
+                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+                L" MinUpdateInterval=ignored_failure HRESULT=0x80004005");
+        }
+        captureStage = L"GraphicsCaptureSession.StartCapture";
         t.session.StartCapture();
+        t.captureStartedTick = GetTickCount64();
+        spatial::diagnostics::Log(L"capture.started",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=GraphicsCaptureSession.StartCapture result=success");
     }
     catch (winrt::hresult_error const& e)
     {
-        ++g_diagCaptureFailures;
-        if (g_diagFirstCaptureHr == S_OK) g_diagFirstCaptureHr = e.code();
-        return false;
+        spatial::diagnostics::Log(L"capture.failure",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=" + captureStage + L" HRESULT=" +
+            spatial::diagnostics::HexHRESULT(e.code()) +
+            L" action=skip_and_continue");
+        return { spatial::discovery::AttemptStatus::Failed, e.code() };
     }
     catch (...)
     {
-        ++g_diagCaptureFailures;
-        if (g_diagFirstCaptureHr == S_OK) g_diagFirstCaptureHr = E_FAIL;
-        return false;
+        spatial::diagnostics::Log(L"capture.failure",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=" + captureStage + L" HRESULT=0x80004005 action=skip_and_continue");
+        return { spatial::discovery::AttemptStatus::Failed, E_FAIL };
     }
     t.ww = (float)t.lastSize.Width;
     t.wh = (float)t.lastSize.Height;
@@ -3029,23 +3302,73 @@ static bool AddTile(HWND hwnd)
     }
     g_tiles.push_back(std::move(t));
     ParkWindow(g_tiles.back(), (int)g_tiles.size() - 1);
+    spatial::diagnostics::Log(L"lifecycle.park",
+        L"hwnd=" + hwndText + L" result=success tile_index=" +
+        std::to_wstring(g_tiles.size() - 1));
     SaveLayout();
-    return true;
+    return { spatial::discovery::AttemptStatus::Captured, S_OK };
+}
+
+static spatial::discovery::AttemptResult AddTile(HWND hwnd)
+{
+    const size_t tilesBefore = g_tiles.size();
+    try
+    {
+        return AddTileCore(hwnd);
+    }
+    catch (winrt::hresult_error const& e)
+    {
+        spatial::diagnostics::Log(L"capture.failure",
+            L"hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
+            L" stage=post_capture_tile_setup HRESULT=" +
+            spatial::diagnostics::HexHRESULT(e.code()) + L" action=cleanup_skip_and_continue");
+        if (g_tiles.size() > tilesBefore)
+        {
+            RestoreOriginal(g_tiles.back());
+            RemoveTileAt(static_cast<int>(g_tiles.size() - 1), false);
+        }
+        return { spatial::discovery::AttemptStatus::Failed, e.code() };
+    }
+    catch (...)
+    {
+        spatial::diagnostics::Log(L"capture.failure",
+            L"hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
+            L" stage=post_capture_tile_setup HRESULT=0x80004005 action=cleanup_skip_and_continue");
+        if (g_tiles.size() > tilesBefore)
+        {
+            RestoreOriginal(g_tiles.back());
+            RemoveTileAt(static_cast<int>(g_tiles.size() - 1), false);
+        }
+        return { spatial::discovery::AttemptStatus::Failed, E_FAIL };
+    }
 }
 
 static void CreateTiles()
 {
-    g_diagEligibleWindows = 0;
-    g_diagCaptureFailures = 0;
-    g_diagFirstCaptureHr = S_OK;
-    std::vector<HWND> wins;
-    EnumWindows(EnumCb, reinterpret_cast<LPARAM>(&wins));
-    g_diagEligibleWindows = wins.size();
-    for (HWND w : wins)
-    {
-        if ((int)g_tiles.size() >= g_set.maxTiles) break;
-        AddTile(w);
-    }
+    g_diag = {};
+    g_captureAttemptSequence = 0;
+    g_captureStartupTick = GetTickCount64();
+    g_noFrameNoticeShown = false;
+
+    EnumerationContext enumeration = EnumerateCaptureCandidates(true);
+    g_diag = enumeration.diagnostics;
+    auto summary = spatial::discovery::ProcessWindowAttempts(
+        enumeration.windows, static_cast<size_t>(std::max(0, g_set.maxTiles)),
+        [](HWND hwnd) { return AddTile(hwnd); });
+    g_diag.attempts = summary.attempted;
+    g_diag.capturesStarted = summary.captured;
+    g_diag.captureFailures = summary.failed;
+    g_diag.userRuleSkipped = summary.skipped;
+    g_diag.firstCaptureHr = summary.firstFailure;
+
+    spatial::diagnostics::Log(L"capture.summary",
+        L"candidates=" + std::to_wstring(g_diag.candidates) +
+        L" attempts=" + std::to_wstring(g_diag.attempts) +
+        L" started=" + std::to_wstring(g_diag.capturesStarted) +
+        L" failures=" + std::to_wstring(g_diag.captureFailures) +
+        L" user_rule_skips=" + std::to_wstring(g_diag.userRuleSkipped) +
+        L" first_failure=" + spatial::diagnostics::HexHRESULT(g_diag.firstCaptureHr) +
+        L" max_tiles=" + std::to_wstring(g_set.maxTiles));
 }
 
 static void FitCamera(bool ignoreSel)
@@ -3452,7 +3775,13 @@ static bool UpdateTiles()
     for (auto& t : g_tiles)
     {
         if (!t.alive) continue;
-        if (!IsWindow(t.source)) { t.alive = false; continue; }
+        if (!IsWindow(t.source))
+        {
+            spatial::diagnostics::Log(L"capture.window_closed",
+                L"hwnd=" + spatial::diagnostics::HexHandle(t.source));
+            t.alive = false;
+            continue;
+        }
         ULONGLONG tn = GetTickCount64();
         if (tn - t.titleTick > 1000)
         {
@@ -3461,14 +3790,29 @@ static bool UpdateTiles()
             if (t.title != b) { t.title = b; any = true; } // zoom-out etiketi tazelensin
             t.titleTick = tn;
         }
+        std::wstring frameStage = L"CaptureFramePool.TryGetNextFrame";
         try
         {
         // NOT: M18'in drain-to-newest + CopySubresourceRegion(içerik-boyut)
         // değişikliği tile'ları SİYAH bıraktı (capture kopyası boş kaldı).
         // M15'teki kanıtlı tek-frame + CopyResource(tam) yoluna dönüldü.
         auto frame = t.pool.TryGetNextFrame();
-        if (!frame) continue;
+        if (!frame)
+        {
+            if (!t.noFrameWarningLogged && t.captureStartedTick &&
+                GetTickCount64() - t.captureStartedTick > 5000)
+            {
+                t.noFrameWarningLogged = true;
+                spatial::diagnostics::Log(L"capture.no_frame",
+                    L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
+                    L" elapsed_ms=" + std::to_wstring(GetTickCount64() - t.captureStartedTick) +
+                    L" stage=CaptureFramePool.TryGetNextFrame result=no_frame_yet");
+            }
+            continue;
+        }
+        frameStage = L"Direct3D11CaptureFrame.ContentSize";
         auto size = frame.ContentSize();
+        frameStage = L"Direct3D11CaptureFrame.Surface";
         auto frameTex = TextureFromSurface(frame.Surface());
         D3D11_TEXTURE2D_DESC fd{};
         frameTex->GetDesc(&fd);
@@ -3487,10 +3831,23 @@ static bool UpdateTiles()
             nd.MiscFlags = 0;
             nd.Usage = D3D11_USAGE_DEFAULT;
             nd.CPUAccessFlags = 0;
+            frameStage = L"ID3D11Device.CreateTexture2D";
             winrt::check_hresult(g_device->CreateTexture2D(&nd, nullptr, t.tex.put()));
+            frameStage = L"ID3D11Device.CreateShaderResourceView";
             winrt::check_hresult(g_device->CreateShaderResourceView(t.tex.get(), nullptr, t.srv.put()));
         }
+        frameStage = L"ID3D11DeviceContext.CopyResource";
         g_ctx->CopyResource(t.tex.get(), frameTex.get());
+        ++t.frameCount;
+        if (t.frameCount == 1)
+        {
+            t.firstFrameTick = GetTickCount64();
+            spatial::diagnostics::Log(L"capture.first_frame",
+                L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
+                L" content_size=" + std::to_wstring(size.Width) + L"x" +
+                std::to_wstring(size.Height) + L" latency_ms=" +
+                std::to_wstring(t.firstFrameTick - t.captureStartedTick));
+        }
         any = true; // M19: yeni kare geldi - ekran değişti
         if (size.Width != t.lastSize.Width || size.Height != t.lastSize.Height)
         {
@@ -3500,8 +3857,12 @@ static bool UpdateTiles()
                 winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
         }
         }
-        catch (...)
+        catch (winrt::hresult_error const& e)
         {
+            spatial::diagnostics::Log(L"capture.frame_failure",
+                L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
+                L" stage=" + frameStage + L" HRESULT=" +
+                spatial::diagnostics::HexHRESULT(e.code()));
             // M18: cihaz kaybını pencere ölümünden AYIR - cihaz kaybında tile
             // öldürmek tüm pencereleri şeritte yetim bırakırdı; reinit devralır
             if (g_device && g_device->GetDeviceRemovedReason() != S_OK)
@@ -3509,8 +3870,39 @@ static bool UpdateTiles()
             else
                 t.alive = false; // pencere/oturum gerçekten öldü
         }
+        catch (...)
+        {
+            spatial::diagnostics::Log(L"capture.frame_failure",
+                L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
+                L" stage=" + frameStage + L" HRESULT=0x80004005");
+            if (g_device && g_device->GetDeviceRemovedReason() != S_OK)
+                g_deviceLost = true;
+            else
+                t.alive = false;
+        }
     }
     return any;
+}
+
+static void MaybeWarnNoFrames()
+{
+    if (g_noFrameNoticeShown || !g_captureStartupTick ||
+        GetTickCount64() - g_captureStartupTick < 8000 || g_tiles.empty())
+        return;
+    size_t frames = 0;
+    for (const auto& tile : g_tiles) frames += tile.frameCount;
+    if (frames != 0) return;
+
+    g_noFrameNoticeShown = true;
+    spatial::diagnostics::Log(L"render.no_frames",
+        L"capture_sessions_started=" + std::to_wstring(g_tiles.size()) +
+        L" frames_received=0 elapsed_ms=" +
+        std::to_wstring(GetTickCount64() - g_captureStartupTick));
+    MessageBoxW(g_hwnd,
+        L"Capture sessions started, but no frames were received within 8 seconds.\n\n"
+        L"The windows were discovered and StartCapture succeeded; the failure is now in frame delivery.\n"
+        L"See SpatialCanvas-debug.log beside SpatialCanvas.exe for per-window details.",
+        L"Spatial Canvas - No capture frames", MB_OK | MB_ICONWARNING);
 }
 
 // ---- M3: Yaşam döngüsü ----
@@ -3600,9 +3992,8 @@ static void AdoptNewWindows()
     ULONGLONG now = GetTickCount64();
     if (now - g_lastAdopt < 1500) return;
     g_lastAdopt = now;
-    std::vector<HWND> wins;
-    EnumWindows(EnumCb, reinterpret_cast<LPARAM>(&wins));
-    for (HWND w : wins)
+    EnumerationContext enumeration = EnumerateCaptureCandidates(false);
+    for (HWND w : enumeration.windows)
     {
         if (g_excluded.count(w)) continue; // serbest bırakılanlar kapılmaz (M6)
         bool known = false;
@@ -3626,58 +4017,6 @@ static void AdoptNewWindows()
             AddTile(w);
         }
     }
-}
-
-// M52: tuvalin o anki görünümünü PNG'ye kaydet (paylaşım için). Ana thread'de,
-// Render içinden Present'tan ÖNCE çağrılır (backbuffer dolu). Yol döner (boş=hata).
-static std::wstring SaveCanvasPng()
-{
-    if (!g_swap || !g_ctx || !g_device || !g_wic) return L"";
-    winrt::com_ptr<ID3D11Texture2D> back;
-    if (FAILED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) return L"";
-    D3D11_TEXTURE2D_DESC d{}; back->GetDesc(&d);
-    D3D11_TEXTURE2D_DESC sd = d;
-    sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0;
-    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
-    winrt::com_ptr<ID3D11Texture2D> stage;
-    if (FAILED(g_device->CreateTexture2D(&sd, nullptr, stage.put()))) return L"";
-    g_ctx->CopyResource(stage.get(), back.get());
-    D3D11_MAPPED_SUBRESOURCE m{};
-    if (FAILED(g_ctx->Map(stage.get(), 0, D3D11_MAP_READ, 0, &m))) return L"";
-    // dosya yolu: %USERPROFILE%\Pictures\SpatialCanvas_<zaman>.png
-    wchar_t* up = nullptr; size_t ul = 0; _wdupenv_s(&up, &ul, L"USERPROFILE");
-    std::wstring dir = (up ? up : L"C:"); free(up);
-    dir += L"\\Pictures"; CreateDirectoryW(dir.c_str(), nullptr);
-    SYSTEMTIME st; GetLocalTime(&st);
-    wchar_t name[80];
-    swprintf_s(name, L"\\SpatialCanvas_%04d%02d%02d_%02d%02d%02d.png",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    std::wstring path = dir + name;
-    bool ok = false;
-    winrt::com_ptr<IWICBitmapEncoder> enc;
-    winrt::com_ptr<IWICStream> stream;
-    if (SUCCEEDED(g_wic->CreateStream(stream.put())) &&
-        SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
-        SUCCEEDED(g_wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, enc.put())) &&
-        SUCCEEDED(enc->Initialize(stream.get(), WICBitmapEncoderNoCache)))
-    {
-        winrt::com_ptr<IWICBitmapFrameEncode> frame;
-        IPropertyBag2* props = nullptr;
-        if (SUCCEEDED(enc->CreateNewFrame(frame.put(), &props)) &&
-            SUCCEEDED(frame->Initialize(props)))
-        {
-            frame->SetSize(d.Width, d.Height);
-            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA; // swapchain BGRA (D2D interop)
-            frame->SetPixelFormat(&fmt);
-            if (SUCCEEDED(frame->WritePixels(d.Height, m.RowPitch, m.RowPitch * d.Height,
-                    (BYTE*)m.pData)) &&
-                SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit()))
-                ok = true;
-        }
-        if (props) props->Release();
-    }
-    g_ctx->Unmap(stage.get(), 0);
-    return ok ? path : L"";
 }
 
 // ---- Render ----
@@ -3753,16 +4092,23 @@ static void Render()
         drawQuad(t.px, t.py, t.pw, t.ph, t.srv.get(), dimOpacity(t), t.blur, t.ww, t.wh);
     }
     DrawOverlay(); // M4: başlık etiketleri + hover vurgusu
-    if (g_pngRequest) // M52: PNG dışa aktar (Present'tan ÖNCE - backbuffer dolu, toast karede yok)
-    {
-        g_pngRequest = false;
-        std::wstring p = SaveCanvasPng();
-        ShowToast(p.empty() ? TL(L"PNG export failed", L"PNG dışa aktarma başarısız")
-            : TL(L"Saved: ", L"Kaydedildi: ") + p);
-    }
     HRESULT hr = g_swap->Present(1, 0);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+    {
+        spatial::diagnostics::Log(L"render.present",
+            L"device lost HRESULT=" + spatial::diagnostics::HexHRESULT(hr));
         g_deviceLost = true; // M18: ana döngü HandleDeviceLost ile kurtarır
+    }
+    else if (FAILED(hr))
+    {
+        static HRESULT lastPresentFailure = S_OK;
+        if (lastPresentFailure != hr)
+        {
+            lastPresentFailure = hr;
+            spatial::diagnostics::Log(L"render.present",
+                L"Present failed HRESULT=" + spatial::diagnostics::HexHRESULT(hr));
+        }
+    }
 }
 
 // M18: cihaz kaybı (TDR, sürücü güncellemesi, uyku) - tam yeniden kurulum.
@@ -3770,6 +4116,7 @@ static void Render()
 // 2px şeritte yetim KALMAZ (bu, uygulamanın en kötü veri-kaybı senaryosuydu).
 static void HandleDeviceLost()
 {
+    spatial::diagnostics::Log(L"render.device_lost", L"starting D3D/WGC recovery");
     g_deviceLost = false;
     g_dragTile = -1; g_groupDrag = false; g_marquee = false; // etkileşim sıfırla
     g_dragNote = -1; g_resizeNote = -1; // M44/M46: not sürükle/boyutlandır
@@ -3831,6 +4178,7 @@ static void HandleDeviceLost()
                 }
             }
             ShowToast(TL(L"Graphics device restored", L"Grafik cihazı yenilendi"));
+            spatial::diagnostics::Log(L"render.device_lost", L"recovery succeeded");
             return;
         }
         catch (...)
@@ -3839,6 +4187,7 @@ static void HandleDeviceLost()
         }
     }
     // 4) Kurtarılamadı: temiz çıkış (done: bloğu pencereleri restore eder)
+    spatial::diagnostics::Log(L"render.device_lost", L"recovery failed; posting quit");
     PostQuitMessage(0);
 }
 
@@ -3865,8 +4214,13 @@ static void ParkWindow(Tile& t, int idx)
     int h = t.origRect.bottom - t.origRect.top;
     // M11: tuval TOPMOST olduğundan park penceresi de TOPMOST'a (tuvalin
     // üstüne) itilir - 2px şerit görünür kalır, occlusion throttle çaresi yaşar
-    SetWindowPos(t.source, HWND_TOPMOST, 60 * idx, g_priH - 2 + t.frameDY - 0,
-        0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    if (!SetWindowPos(t.source, HWND_TOPMOST, 60 * idx, g_priH - 2 + t.frameDY - 0,
+        0, 0, SWP_NOSIZE | SWP_NOACTIVATE))
+    {
+        spatial::diagnostics::Log(L"lifecycle.park_failure",
+            L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
+            L" Win32Error=" + std::to_wstring(GetLastError()));
+    }
     // pencerenin görünür üst kenarı ANA monitörün 2px altından başlasın:
     RECT now{}; GetWindowRect(t.source, &now);
     int visTop = now.top + t.frameDY;
@@ -3944,6 +4298,9 @@ static void TrySwapIn(int idx, POINT clientAnchor)
     if (idx < 0 || idx >= (int)g_tiles.size()) return;
     Tile& t = g_tiles[idx];
     if (!t.alive || !IsWindow(t.source)) return;
+    spatial::diagnostics::Log(L"lifecycle.swap_in",
+        L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
+        L" tile_index=" + std::to_wstring(idx) + L" begin");
     // Geri dönüş için kamerayı kaydet (tek tıkla aynı manzaraya dönülür)
     g_preSwapZoom = g_cam.zoom;
     g_preSwapX = g_cam.x;
@@ -3995,12 +4352,16 @@ static void TrySwapIn(int idx, POINT clientAnchor)
     g_activeTile = idx;
     t.activeSeq = ++g_activeCounter; // M21: Tab MRU sırası
     g_swapArmed = false;
+    spatial::diagnostics::Log(L"lifecycle.swap_in",
+        L"hwnd=" + spatial::diagnostics::HexHandle(t.source) + L" result=success");
 }
 
 static void SwapOut()
 {
     if (g_activeTile < 0) return;
     Tile& t = g_tiles[g_activeTile];
+    spatial::diagnostics::Log(L"lifecycle.swap_out",
+        L"hwnd=" + spatial::diagnostics::HexHandle(t.source) + L" begin");
     if (IsWindow(t.source)) ParkWindow(t, g_activeTile);
     g_activeTile = -1;
     RaiseCanvasTopmost(); // M11: tuval moduna dönüş - görev çubuğunun üstüne
@@ -4009,6 +4370,8 @@ static void SwapOut()
     g_camT.x = g_preSwapX;
     g_camT.y = g_preSwapY;
     ForceForeground(g_hwnd);
+    spatial::diagnostics::Log(L"lifecycle.swap_out",
+        L"hwnd=" + spatial::diagnostics::HexHandle(t.source) + L" result=success");
 }
 
 // Global hook: ayarlı-modifikatör+Wheel = her yerden zoom, ayarlı fare tuşu = geri çekil
@@ -4468,7 +4831,6 @@ static void ProcessIpcCommand(const std::wstring& cmd)
 {
     auto starts = [&](const wchar_t* p) { return cmd.rfind(p, 0) == 0; };
     if (cmd == L"fit") FitCamera(true);
-    else if (cmd == L"png") g_pngRequest = true; // M52: tuvali PNG'ye aktar
     else if (starts(L"zone:")) // M54: görüş merkezine bölge ekle
     {
         Zone z; z.title = cmd.substr(5);
@@ -5429,12 +5791,6 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ShowToast(TL(L"Note: type, Tab=color, Enter=done", L"Not: yaz, Tab=renk, Enter=bitir"));
             return 0;
         }
-        // M52: Ctrl+Shift+S - tuvali PNG'ye aktar (Render bir sonraki karede kaydeder)
-        if (mods == 5 && vk == 'S' && g_activeTile < 0)
-        {
-            g_pngRequest = true;
-            return 0;
-        }
         // M74: Ctrl+Shift+D - odak/dim modu (odak dışı pencereler soluk)
         if (mods == 5 && vk == 'D' && g_activeTile < 0)
         {
@@ -5570,12 +5926,14 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // ---- Giriş noktası ----
 int RunCanvasApp()
 {
+    spatial::diagnostics::Log(L"canvas.startup", L"RunCanvasApp begin");
     // M16: tek örnek kilidi - HER ŞEYDEN önce. İkinci kopya RecoverFromCrash
     // ile canlı oturumun pending_restore'unu yer, taskbar'ı geri açar ve
     // park şeridi/LL hook için ilk kopyayla kavga ederdi.
     CreateMutexW(nullptr, TRUE, L"Local\\SpatialCanvas.SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
+        spatial::diagnostics::Log(L"canvas.startup", L"existing instance detected; activating and exiting");
         HWND prev = FindWindowW(L"SpatialCanvasWnd", nullptr);
         if (prev) SetForegroundWindow(prev);
         return 0;
@@ -5588,7 +5946,11 @@ int RunCanvasApp()
     std::set_terminate([] { EmergencyRestore(); std::abort(); });
 
     // DPI: fiziksel piksel hizalaması için PMv2 (manifest'te yok, koddan)
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        spatial::diagnostics::Log(L"canvas.dpi",
+            L"SetProcessDpiAwarenessContext failed Win32Error=" + std::to_wstring(GetLastError()));
+    else
+        spatial::diagnostics::Log(L"canvas.dpi", L"per-monitor-v2 enabled");
 
     // Önceki oturum çökmüşse parkta kalan pencereleri kurtar
     RecoverFromCrash();
@@ -5629,10 +5991,28 @@ int RunCanvasApp()
     wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
     wc.hIconSm = wc.hIcon;
     wc.lpszClassName = L"SpatialCanvasWnd";
-    RegisterClassExW(&wc);
+    ATOM windowClass = RegisterClassExW(&wc);
+    if (!windowClass)
+    {
+        DWORD error = GetLastError();
+        spatial::diagnostics::Log(L"canvas.window",
+            L"RegisterClassExW failed Win32Error=" + std::to_wstring(error));
+        winrt::throw_hresult(HRESULT_FROM_WIN32(error));
+    }
 
     g_hwnd = CreateWindowExW(0, L"SpatialCanvasWnd", L"Spatial Canvas",
         WS_POPUP, g_vx, g_vy, g_sw, g_sh, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!g_hwnd)
+    {
+        DWORD error = GetLastError();
+        spatial::diagnostics::Log(L"canvas.window",
+            L"CreateWindowExW failed Win32Error=" + std::to_wstring(error));
+        winrt::throw_hresult(HRESULT_FROM_WIN32(error));
+    }
+    spatial::diagnostics::Log(L"canvas.window",
+        L"canvas_hwnd=" + spatial::diagnostics::HexHandle(g_hwnd) +
+        L" geometry=" + std::to_wstring(g_vx) + L"," + std::to_wstring(g_vy) +
+        L"," + std::to_wstring(g_sw) + L"x" + std::to_wstring(g_sh));
 
     // M16: explorer yeniden başlarsa yeni görev çubuğunu tekrar gizleyebilmek
     // için yayın mesajına abone ol (filtre: yükseltilmiş çalışmada UIPI düşürür)
@@ -5654,19 +6034,37 @@ int RunCanvasApp()
     {
         bool wgcSupported = false;
         try { wgcSupported = winrt::GraphicsCaptureSession::IsSupported(); } catch (...) {}
-        wchar_t msg[768]{};
-        swprintf_s(msg,
-            L"No window found to capture.\n\n"
-            L"Corporate-safe diagnostics (no window titles/content logged):\n"
-            L"Eligible top-level windows: %zu\n"
-            L"Windows.Graphics.Capture supported: %s\n"
-            L"Capture failures: %d\n"
-            L"First capture HRESULT: 0x%08lX",
-            g_diagEligibleWindows,
-            wgcSupported ? L"YES" : L"NO",
-            g_diagCaptureFailures,
-            static_cast<unsigned long>(g_diagFirstCaptureHr));
-        MessageBoxW(nullptr, msg, L"Spatial Canvas - Capture diagnostics", MB_OK | MB_ICONWARNING);
+        std::wstring reason;
+        if (!wgcSupported)
+            reason = L"Windows.Graphics.Capture is unavailable.";
+        else if (spatial::diagnostics::DesktopMismatchDetected())
+            reason = L"The process desktop does not match the interactive input desktop.";
+        else if (!g_diag.enumWindowsResult &&
+            (!g_diag.desktopFallbackUsed || !g_diag.enumDesktopResult))
+            reason = L"Window enumeration APIs failed.";
+        else if (g_diag.enumWindowsCallbacks + g_diag.enumDesktopCallbacks == 0)
+            reason = L"Window enumeration returned no HWNDs.";
+        else if (g_diag.candidates == 0)
+            reason = L"Windows were enumerated, but all were structurally skipped.";
+        else if (g_diag.attempts > 0 && g_diag.captureFailures > 0)
+            reason = L"Capture was attempted, but every attempted window failed.";
+        else if (g_diag.userRuleSkipped == g_diag.attempts && g_diag.attempts > 0)
+            reason = L"All candidates were excluded by the user's rules.txt.";
+        else
+            reason = L"Candidates existed, but no capture session was started.";
+
+        std::wstring message = reason +
+            L"\n\nEnumWindows callbacks: " + std::to_wstring(g_diag.enumWindowsCallbacks) +
+            L"\nEnumDesktopWindows callbacks: " + std::to_wstring(g_diag.enumDesktopCallbacks) +
+            L"\nUnique HWNDs observed: " + std::to_wstring(g_diag.uniqueWindows) +
+            L"\nCapture candidates: " + std::to_wstring(g_diag.candidates) +
+            L"\nCapture attempts: " + std::to_wstring(g_diag.attempts) +
+            L"\nCapture failures: " + std::to_wstring(g_diag.captureFailures) +
+            L"\nFirst capture HRESULT: " + spatial::diagnostics::HexHRESULT(g_diag.firstCaptureHr) +
+            L"\n\nSee SpatialCanvas-debug.log beside SpatialCanvas.exe for complete details.";
+        spatial::diagnostics::Log(L"startup.no_tiles", L"reason=" + reason);
+        MessageBoxW(nullptr, message.c_str(), L"Spatial Canvas - No captured windows",
+            MB_OK | MB_ICONWARNING);
         return 1;
     }
     ReconcileConnectors(); // M75: yüklenen bağlayıcıları açık pencerelere bağla
@@ -5695,6 +6093,11 @@ int RunCanvasApp()
     ReRegisterPullHotkey(); // M8: ayarlı global geri-çekil kısayolu
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouseProc,
         GetModuleHandleW(nullptr), 0);
+    if (!g_mouseHook)
+        spatial::diagnostics::Log(L"input.mouse_hook",
+            L"SetWindowsHookExW failed Win32Error=" + std::to_wstring(GetLastError()));
+    else
+        spatial::diagnostics::Log(L"input.mouse_hook", L"WH_MOUSE_LL installed");
 
     MSG msg{};
     g_lastTick = GetTickCount64();
@@ -5849,6 +6252,7 @@ int RunCanvasApp()
         // M17: toast animasyonu sürerken çiz
         if (!g_toast.empty() && GetTickCount64() - g_toastTick < 1600) dirty = true;
         if (UpdateTiles()) dirty = true; // M19: yeni kare/başlık geldi
+        MaybeWarnNoFrames();
         if (dirty)
             Render();
         else
@@ -5859,6 +6263,7 @@ int RunCanvasApp()
                 g_activeTile >= 0 ? 33 : 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
 done:
+    spatial::diagnostics::Log(L"shutdown", L"message loop ending; restoring windows");
     // M2 temizlik: hook/hotkey kaldır, TÜM pencereleri orijinal yerine koy
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
     UnregisterHotKey(g_hwnd, HOTKEY_TOGGLE);
@@ -5873,5 +6278,6 @@ done:
     SaveSpaces(); // M73 Slice 3: tuval yapısı + üyelikleri kalıcılaştır (tek tuvalde dosyayı siler)
     SaveSettings(); // M50: son kamera görünümünü de yaz (restore için)
     DeleteFileW(PendingFilePath().c_str()); // temiz çıkış - sigorta dosyası silinir
+    spatial::diagnostics::Log(L"shutdown", L"window restore and cleanup completed");
     return (int)msg.wParam;
 }

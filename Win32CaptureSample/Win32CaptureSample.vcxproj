@@ -143,12 +143,16 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Canvas.cpp" />
+    <ClCompile Include="Diagnostics.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="pch.cpp" />
+    <ClCompile Include="WindowDiscovery.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Canvas.h" />
+    <ClInclude Include="Diagnostics.h" />
     <ClInclude Include="pch.h" />
+    <ClInclude Include="WindowDiscovery.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="app.rc" />

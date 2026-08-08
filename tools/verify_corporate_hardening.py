@@ -3,60 +3,102 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-CANVAS = ROOT / "Win32CaptureSample" / "Canvas.cpp"
-MANIFEST = ROOT / "Win32CaptureSample" / "app.manifest"
+SOURCE_DIR = ROOT / "Win32CaptureSample"
+MANIFEST = SOURCE_DIR / "app.manifest"
+DISCOVERY = SOURCE_DIR / "WindowDiscovery.cpp"
+DIAGNOSTICS = SOURCE_DIR / "Diagnostics.cpp"
 
-source = CANVAS.read_text(encoding="utf-8-sig")
+runtime_files = sorted(
+    list(SOURCE_DIR.glob("*.cpp"))
+    + list(SOURCE_DIR.glob("*.h"))
+    + list(SOURCE_DIR.glob("*.vcxproj"))
+)
+runtime_text = "\n".join(path.read_text(encoding="utf-8-sig") for path in runtime_files)
+runtime_lower = runtime_text.lower()
 manifest = MANIFEST.read_text(encoding="utf-8-sig")
+discovery = DISCOVERY.read_text(encoding="utf-8-sig")
+diagnostics = DIAGNOSTICS.read_text(encoding="utf-8-sig")
 
-forbidden = {
+forbidden_case_sensitive = {
     "WinINet header": "#include <wininet.h>",
     "WinINet library": 'pragma comment(lib, "wininet.lib")',
-    "network open": "InternetOpenW(",
-    "network URL open": "InternetOpenUrlW(",
+    "WinHTTP header": "#include <winhttp.h>",
+    "WinHTTP library": 'pragma comment(lib, "winhttp.lib")',
+    "WinINet API": "InternetOpenW(",
+    "WinINet URL API": "InternetOpenUrlW(",
+    "WinHTTP API": "WinHttpOpen(",
+    "Winsock startup": "WSAStartup(",
+    "Winsock socket": "WSASocketW(",
     "registry read": "RegOpenKeyExW(",
     "registry value query": "RegQueryValueExW(",
     "registry App Paths lookup": "RegGetValueW(",
-    "upstream VERSION URL": "raw.githubusercontent.com/13auth/spatial-canvas",
-    "upstream release URL": "github.com/13auth/spatial-canvas/releases",
     "registry write": "RegSetValueExW(",
     "registry delete": "RegDeleteValueW(",
     "named pipe server": "CreateNamedPipeW(",
-    "autostart query symbol": "QueryAutostart",
-    "autostart apply symbol": "ApplyAutostart",
+    "service creation": "CreateServiceW(",
+    "service manager": "OpenSCManagerW(",
+    "remote process memory": "WriteProcessMemory(",
+    "remote thread injection": "CreateRemoteThread(",
+    "cross-process allocation": "VirtualAllocEx(",
+    "screenshot export": "SaveCanvasPng",
+    "PNG frame encoder": "GUID_ContainerFormatPng",
     "persisted window-title capture": "GetWindowTextW(t.source, title, 256);",
 }
 
+forbidden_case_insensitive = {
+    "Winsock header": "winsock2.h",
+    "Winsock library": "ws2_32.lib",
+    "upstream update host": "raw.githubusercontent.com/13auth/spatial-canvas",
+    "upstream release URL": "github.com/13auth/spatial-canvas/releases",
+    "scheduled-task launcher": "schtasks.exe",
+}
+
 errors = []
-for name, needle in forbidden.items():
-    if needle in source:
+for name, needle in forbidden_case_sensitive.items():
+    if needle in runtime_text:
+        errors.append(f"FORBIDDEN: {name}: {needle}")
+for name, needle in forbidden_case_insensitive.items():
+    if needle.lower() in runtime_lower:
         errors.append(f"FORBIDDEN: {name}: {needle}")
 
-# Core behavior that must survive the hardening patch.
-core_required = {
-    "mouse-key helper preserved": "static bool IsMouseVk(int vk)",
-    "InitD2D declaration preserved": "static void InitD2D();",
-    "pull-hotkey declaration preserved": "static void ReRegisterPullHotkey();",
-    "search declaration preserved": "static void UpdateMatches();",
-    "raise-canvas declaration preserved": "static void RaiseCanvasTopmost();",
-    "lower-canvas declaration preserved": "static void LowerCanvas();",
+required_runtime = {
+    "explicit non-elevated execution": (
+        manifest, 'requestedExecutionLevel level="asInvoker" uiAccess="false"'),
+    "network default disabled": (runtime_text, "bool updateCheck = false;"),
+    "IPC server neutralized": (
+        runtime_text, "Corporate-safe baseline: no local named-pipe server."),
+    "window-title crash persistence redacted": (
+        runtime_text, "Corporate-safe: do not persist window titles"),
+    "executable-adjacent debug log": (diagnostics, "SpatialCanvas-debug.log"),
+    "debug log is UTF-8": (diagnostics, "WideCharToMultiByte(CP_UTF8"),
+    "debug log flushes": (diagnostics, "FlushFileBuffers(g_log)"),
+    "privacy-safe title metadata": (runtime_text, 'L" title_length="'),
+    "broad discovery evaluator": (discovery, "WindowDecision EvaluateWindow"),
+    "per-HWND failure isolation": (discovery, "ProcessWindowAttempts"),
+    "EnumDesktopWindows fallback": (runtime_text, "EnumDesktopWindows("),
+    "intentional global mouse hook preserved": (
+        runtime_text, "SetWindowsHookExW(WH_MOUSE_LL"),
+    "capture attempt continues": (runtime_text, "action=skip_and_continue"),
 }
-
-for name, required_text in core_required.items():
-    if required_text not in source:
-        errors.append(f"MISSING CORE: {name}: {required_text}")
-
-required = {
-    "explicit non-elevated execution": 'requestedExecutionLevel level="asInvoker" uiAccess="false"',
-    "network default disabled": "bool updateCheck = false;",
-    "IPC neutralized": "Corporate-safe baseline: no local named-pipe server.",
-    "window titles redacted": "Corporate-safe: do not persist window titles",
-}
-
-for name, needle in required.items():
-    haystack = manifest if "requestedExecutionLevel" in needle else source
+for name, (haystack, needle) in required_runtime.items():
     if needle not in haystack:
         errors.append(f"MISSING: {name}: {needle}")
+
+# The pure decision function must not turn presentation metadata or application
+# technology into compatibility filters. Those facts may still be logged by Canvas.
+for needle in (
+    "WS_EX_TOOLWINDOW",
+    "GW_OWNER",
+    "GetWindowText",
+    "ApplicationFrameWindow",
+    "Chrome_WidgetWin",
+    "Electron",
+):
+    if needle in discovery:
+        errors.append(f"OVER-FILTERING: discovery logic contains {needle}")
+
+if "GetWindowText" in diagnostics:
+    errors.append("PRIVACY: Diagnostics.cpp must never obtain window-title text")
 
 if errors:
     print("Corporate-safe verification FAILED")
@@ -65,8 +107,10 @@ if errors:
     sys.exit(1)
 
 print("Corporate-safe verification PASSED")
-print(" - no WinINet update path")
-print(" - no HKCU Run registry read/write path")
-print(" - no named-pipe server")
-print(" - no persisted window-title capture in crash-recovery file")
+print(" - no WinINet, WinHTTP, or Winsock path")
+print(" - no HKCU Run/registry persistence path")
+print(" - no named-pipe server, services, tasks, or injection APIs")
+print(" - no screenshot/frame export path")
+print(" - debug log is executable-adjacent UTF-8 and title-content safe")
+print(" - broad discovery and per-HWND failure isolation are enforced")
 print(" - manifest explicitly uses asInvoker / uiAccess=false")

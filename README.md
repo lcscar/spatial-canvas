@@ -65,8 +65,7 @@ screenshot proxy.** Pull back and it parks again, textures still live.
 - 🚀 **Launch without leaving** — right-edge app dock (real icons) and a
   `Ctrl+N` command palette.
 - 📌 **Pin, duplicate, arrange** — pin a window as a screen-fixed HUD
-  (`Ctrl+P`), duplicate (`Ctrl+C/V`), arrange into a grid (`Ctrl+G`), export the
-  canvas to PNG (`Ctrl+Shift+S`).
+  (`Ctrl+P`), duplicate (`Ctrl+C/V`), and arrange into a grid (`Ctrl+G`).
 - 💾 **Remembers everything** — per-window layout, notes, zones, bookmarks, and
   settings persist across sessions.
 
@@ -96,7 +95,6 @@ screenshot proxy.** Pull back and it parks again, textures still live.
 | Move / edit / resize / delete note | Left-drag · double-click = edit · bottom-right corner = resize · hover **✕** = delete |
 | Zone frame (group windows) | **Ctrl+Shift+Z** = labeled region · drag the **title bar** to move it **and the windows inside** (body is click-through) · corner = resize |
 | Connector arrow (+ label) | **Ctrl+drag** window→window · type a label, **Enter** · midpoint **✕** removes · **persists** across restarts |
-| Export canvas to PNG | **Ctrl+Shift+S** (saved to your Pictures folder) |
 | Undo last delete | **Ctrl+Z** (restores the last removed note / zone / connector) |
 | **Space:** new / switch | **Ctrl+T** / **Ctrl+Tab** (Ctrl+Shift+Tab back) |
 | **Space:** add/remove window | **Ctrl+Alt+1–9** (pointed or selected window) |
