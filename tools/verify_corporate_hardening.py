@@ -121,7 +121,8 @@ for needle in (
     "contents: write",
     "Publish executable-only distribution branch",
     "refs/heads/release/exe-only",
-    "git mktree",
+    "git update-index --add --cacheinfo",
+    "git write-tree",
 ):
     if needle not in build_workflow:
         errors.append(f"DELIVERY: automated executable-only publish is missing: {needle}")

@@ -74,8 +74,13 @@ jobs:
 
           $blob = git hash-object -w $exe
           if ($LASTEXITCODE -ne 0) { throw 'Could not create executable blob' }
-          $treeLine = "100644 blob $blob`tSpatialCanvas.exe"
-          $tree = $treeLine | git mktree
+          $distributionIndex = Join-Path $env:RUNNER_TEMP 'spatial-canvas-distribution.index'
+          $env:GIT_INDEX_FILE = $distributionIndex
+          git read-tree --empty
+          if ($LASTEXITCODE -ne 0) { throw 'Could not initialize executable-only index' }
+          git update-index --add --cacheinfo "100644,$blob,SpatialCanvas.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not add executable to distribution index' }
+          $tree = git write-tree
           if ($LASTEXITCODE -ne 0) { throw 'Could not create executable-only tree' }
           $parent = git rev-parse refs/remotes/origin/release/exe-only
           $message = "Automated Release x64 from $env:GITHUB_SHA"
