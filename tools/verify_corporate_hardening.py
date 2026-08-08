@@ -7,6 +7,7 @@ SOURCE_DIR = ROOT / "Win32CaptureSample"
 MANIFEST = SOURCE_DIR / "app.manifest"
 DISCOVERY = SOURCE_DIR / "WindowDiscovery.cpp"
 DIAGNOSTICS = SOURCE_DIR / "Diagnostics.cpp"
+CANVAS = SOURCE_DIR / "Canvas.cpp"
 
 runtime_files = sorted(
     list(SOURCE_DIR.glob("*.cpp"))
@@ -18,6 +19,7 @@ runtime_lower = runtime_text.lower()
 manifest = MANIFEST.read_text(encoding="utf-8-sig")
 discovery = DISCOVERY.read_text(encoding="utf-8-sig")
 diagnostics = DIAGNOSTICS.read_text(encoding="utf-8-sig")
+canvas = CANVAS.read_text(encoding="utf-8-sig")
 
 forbidden_case_sensitive = {
     "WinINet header": "#include <wininet.h>",
@@ -43,6 +45,9 @@ forbidden_case_sensitive = {
     "screenshot export": "SaveCanvasPng",
     "PNG frame encoder": "GUID_ContainerFormatPng",
     "persisted window-title capture": "GetWindowTextW(t.source, title, 256);",
+    "optional WGC update interval in startup": ".MinUpdateInterval(",
+    "optional WGC cursor property in startup": ".IsCursorCaptureEnabled(",
+    "legacy capture-count ceiling": "maxTiles",
 }
 
 forbidden_case_insensitive = {
@@ -76,6 +81,10 @@ required_runtime = {
     "privacy-safe title metadata": (runtime_text, 'L" title_length="'),
     "broad discovery evaluator": (discovery, "WindowDecision EvaluateWindow"),
     "per-HWND failure isolation": (discovery, "ProcessWindowAttempts"),
+    "independent capture workers": (
+        discovery, "DispatchWindowAttemptsIndependently"),
+    "frame-arrival registration": (canvas, ".FrameArrived("),
+    "unlimited capture dispatch": (canvas, "capture_limit=none"),
     "EnumDesktopWindows fallback": (runtime_text, "EnumDesktopWindows("),
     "intentional global mouse hook preserved": (
         runtime_text, "SetWindowsHookExW(WH_MOUSE_LL"),
@@ -101,6 +110,11 @@ for needle in (
 if "GetWindowText" in diagnostics:
     errors.append("PRIVACY: Diagnostics.cpp must never obtain window-title text")
 
+show_canvas = canvas.find("ShowWindow(g_hwnd, SW_SHOW)")
+start_discovery = canvas.find("StartDiscoveryAsync(true)")
+if show_canvas < 0 or start_discovery < 0 or show_canvas > start_discovery:
+    errors.append("STARTUP: Canvas must be shown before asynchronous discovery begins")
+
 if errors:
     print("Corporate-safe verification FAILED")
     for error in errors:
@@ -113,5 +127,6 @@ print(" - no HKCU Run/registry persistence path")
 print(" - no named-pipe server, services, tasks, or injection APIs")
 print(" - no screenshot/frame export path")
 print(" - debug log is executable-adjacent UTF-8 and title-content safe")
-print(" - broad discovery and per-HWND failure isolation are enforced")
+print(" - broad discovery, independent per-HWND workers, and no capture ceiling are enforced")
+print(" - optional WGC session properties are absent from the startup path")
 print(" - manifest explicitly uses asInvoker / uiAccess=false")

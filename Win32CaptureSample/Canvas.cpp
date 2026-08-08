@@ -18,6 +18,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #include <exception>
+#include <deque>
 #include <thread>
 #include <unordered_map>
 #include <mutex>
@@ -84,6 +85,8 @@ struct Tile
     winrt::GraphicsCaptureItem item{ nullptr };
     winrt::Direct3D11CaptureFramePool pool{ nullptr };
     winrt::GraphicsCaptureSession session{ nullptr };
+    winrt::event_token frameArrivedToken{};
+    bool frameArrivedRegistered = false;
     winrt::com_ptr<ID3D11Texture2D> tex;
     winrt::com_ptr<ID3D11ShaderResourceView> srv;
     winrt::SizeInt32 lastSize{};
@@ -135,7 +138,6 @@ struct Settings
     bool labels = true;     // başlık etiketleri
     bool hover = true;      // vurgu çerçevesi
     float diveZoom = 0.92f; // swap-in eşiği
-    int maxTiles = 12;      // 6 / 9 / 12 / 16
     int bgPreset = 0;       // 0 koyu, 1 gece, 2 siyah
     bool grid = true;       // M12: dünyaya çakılı nokta ızgara
     bool minimap = true;    // M36: sağ-alt kuşbakışı minimap
@@ -206,7 +208,15 @@ namespace
     } g_diag;
     ULONGLONG g_captureStartupTick = 0;
     bool g_noFrameNoticeShown = false;
-    size_t g_captureAttemptSequence = 0;
+    std::atomic_size_t g_captureAttemptSequence{ 0 };
+    std::unordered_set<HWND> g_captureScheduled;
+    std::unordered_set<HWND> g_capturePending;
+    std::atomic<bool> g_discoveryInFlight{ false };
+    std::atomic<bool> g_frameWakePending{ false };
+    bool g_frameWakeRequested = false;
+    bool g_initialDiscoveryCompleted = false;
+    bool g_startupIssueReported = false;
+    bool g_hungAttemptsLogged = false;
     bool g_panelOpen = false;
     float g_panelA = 0.0f;          // 0 kapalı, 1 açık (animasyonlu)
     constexpr float PANEL_W = 320.0f;
@@ -372,6 +382,9 @@ namespace
     std::vector<std::wstring> g_ipcQueue;      // M30: pipe thread → ana thread
     std::mutex g_ipcMutex;
     constexpr UINT MSG_UPDATE = WM_APP + 4;    // M48: yeni sürüm bulundu (thread → ana)
+    constexpr UINT MSG_DISCOVERY_COMPLETE = WM_APP + 5;
+    constexpr UINT MSG_CAPTURE_COMPLETE = WM_APP + 6;
+    constexpr UINT MSG_CAPTURE_FRAME = WM_APP + 7;
     std::wstring g_updateVer;                  // M48: feed'deki yeni sürüm (boş=yok)
     std::mutex g_updateMutex;
     bool g_updateAvail = false;                // M48: kalıcı HUD ipucu için
@@ -419,7 +432,6 @@ static void ForceForeground(HWND hwnd);
 static int HitTile(float wx, float wy);
 static int HitPinned(POINT cp); // M73: ekran-uzayı pinned tile vuruşu
 static void SaveSettings();
-static void ApplyFpsCap();
 static void RestoreOriginal(Tile& t);
 static void RemoveTileAt(int i, bool restoreWindow); // M73: tuval silmede yetim tile'ı kaldır
 static void InitD2D();
@@ -588,6 +600,30 @@ struct EnumerationContext
     bool desktopPass = false;
     bool logEachWindow = false;
 };
+
+struct CaptureCompletion
+{
+    HWND hwnd{};
+    size_t attemptNumber = 0;
+    spatial::discovery::AttemptResult result;
+    Tile tile;
+};
+
+struct DiscoveryCompletion
+{
+    bool initial = false;
+    EnumerationContext enumeration;
+};
+
+struct CaptureCoordinator
+{
+    std::mutex mutex;
+    std::deque<CaptureCompletion> captures;
+    std::deque<DiscoveryCompletion> discoveries;
+    std::atomic<bool> closing{ false };
+};
+
+static std::shared_ptr<CaptureCoordinator> g_captureCoordinator;
 
 static std::wstring ProcessNameOf(DWORD pid, DWORD& error)
 {
@@ -1028,7 +1064,6 @@ static std::wstring RowLabel(int id)
     case 2: return TL(L"Title labels", L"Başlık etiketleri");
     case 3: return TL(L"Hover frame", L"Vurgu çerçevesi");
     case 4: return TL(L"Dive threshold", L"Dalış eşiği");
-    case 5: return TL(L"Max windows", L"Maks. pencere");
     case 6: return TL(L"Background", L"Arka plan");
     case 7: return TL(L"Start with Windows", L"Windows ile başlat");
     case 8: return TL(L"Canvas area", L"Tuval alanı");
@@ -1060,7 +1095,6 @@ static std::wstring RowValue(int id)
     case 2: return g_set.labels ? TL(L"On", L"Açık") : TL(L"Off", L"Kapalı");
     case 3: return g_set.hover ? TL(L"On", L"Açık") : TL(L"Off", L"Kapalı");
     case 4: return g_set.diveZoom < 0.9f ? TL(L"Early", L"Erken") : TL(L"Normal", L"Normal");
-    case 5: return std::to_wstring(g_set.maxTiles);
     case 6: return g_set.bgPreset == 0 ? TL(L"Dark", L"Koyu") : (g_set.bgPreset == 1 ? TL(L"Night", L"Gece")
         : (g_set.bgPreset == 2 ? TL(L"Black", L"Siyah") : TL(L"Vignette", L"Vinyet")));
     case 7: return g_set.autostart ? TL(L"On", L"Açık") : TL(L"Off", L"Kapalı");
@@ -1088,16 +1122,11 @@ static void CycleRow(int id)
     {
     case 0:
         g_set.fpsCap = (g_set.fpsCap == 15) ? 30 : (g_set.fpsCap == 30 ? 60 : 15);
-        ApplyFpsCap();
         break;
     case 1: g_set.animSpeed = (g_set.animSpeed + 1) % 3; break;
     case 2: g_set.labels = !g_set.labels; break;
     case 3: g_set.hover = !g_set.hover; break;
     case 4: g_set.diveZoom = (g_set.diveZoom < 0.9f) ? 0.92f : 0.80f; break;
-    case 5:
-        g_set.maxTiles = (g_set.maxTiles == 6) ? 9 : (g_set.maxTiles == 9 ? 12
-            : (g_set.maxTiles == 12 ? 16 : 6));
-        break;
     case 6: g_set.bgPreset = (g_set.bgPreset + 1) % 4; break; // M29: +Vinyet
     case 7: g_set.autostart = false; break; // Corporate-safe: autostart disabled
     case 8: g_set.canvasSpan = 1 - g_set.canvasSpan; ApplyCanvasSpan(); break; // M8: canlı
@@ -1214,11 +1243,11 @@ static void DrawPanel(POINT cur)
     }
     // satırlar (aktif sekmeye göre)
     float y = top + 116;
-    static const int T0[] = { 11,12,13,0,1,2,3,4,5,6,7,8,9,10 }; // M47/M48/M50 üstte
+    static const int T0[] = { 11,12,13,0,1,2,3,4,6,7,8,9,10 }; // M47/M48/M50 üstte
     static const int T1[] = { 101,102,103,104,105,106,107 };
     const int* ids = g_panelTab ? T1 : T0;
-    int idCount = g_panelTab ? 7 : 14;
-    // M50: satır yüksekliğini ekrana göre kıs (14 satır kısa ekranda taşmasın)
+    int idCount = g_panelTab ? 7 : 13;
+    // M50: satır yüksekliğini ekrana göre kıs (kısa ekranda taşmasın)
     const float rowH = std::min(50.0f, ((float)g_priH - 130.0f) / (float)idCount);
     for (int idx = 0; idx < idCount; idx++)
     {
@@ -2925,7 +2954,6 @@ static void LoadSettings()
         else if (k == L"labels") g_set.labels = _wtoi(v.c_str()) != 0;
         else if (k == L"hover") g_set.hover = _wtoi(v.c_str()) != 0;
         else if (k == L"dive") g_set.diveZoom = (float)_wtof(v.c_str());
-        else if (k == L"max") g_set.maxTiles = _wtoi(v.c_str());
         else if (k == L"lang") g_set.lang = _wtoi(v.c_str()); // M47
         else if (k == L"updchk") g_set.updateCheck = false; // Corporate-safe: ignore persisted enablement
         else if (k == L"updurl") g_set.updateUrl = v; // M48 (test/override)
@@ -2986,7 +3014,6 @@ static void LoadSettings()
     if (g_set.fpsCap != 15 && g_set.fpsCap != 30 && g_set.fpsCap != 60) g_set.fpsCap = 30;
     g_set.animSpeed = std::clamp(g_set.animSpeed, 0, 2);
     if (g_set.diveZoom < 0.5f || g_set.diveZoom > 1.0f) g_set.diveZoom = 0.92f;
-    g_set.maxTiles = std::clamp(g_set.maxTiles, 4, 16);
     g_set.lang = std::clamp(g_set.lang, 0, 1); // M47
     g_set.bgPreset = std::clamp(g_set.bgPreset, 0, 3); // M29
     g_set.canvasSpan = std::clamp(g_set.canvasSpan, 0, 1);
@@ -3010,7 +3037,6 @@ static void SaveSettings()
     f << L"labels=" << (g_set.labels ? 1 : 0) << L"\n";
     f << L"hover=" << (g_set.hover ? 1 : 0) << L"\n";
     f << L"dive=" << g_set.diveZoom << L"\n";
-    f << L"max=" << g_set.maxTiles << L"\n";
     f << L"bg=" << g_set.bgPreset << L"\n";
     f << L"grid=" << (g_set.grid ? 1 : 0) << L"\n";
     f << L"mmap=" << (g_set.minimap ? 1 : 0) << L"\n"; // M36
@@ -3027,23 +3053,6 @@ static void SaveSettings()
             f << L"anc" << i << L"=" << g_anchors[i].x << L":" << g_anchors[i].y
               << L":" << g_anchors[i].zoom << L"\n";
 }
-
-static void ApplyFpsCap()
-{
-    for (auto& t : g_tiles)
-    {
-        try
-        {
-            t.session.MinUpdateInterval(
-                winrt::TimeSpan{ std::chrono::milliseconds(1000 / std::max(1, g_set.fpsCap)) });
-        }
-        catch (...) {}
-    }
-}
-
-
-
-
 
 // M8: global geri-çekil kısayolunu (yeniden) kaydet
 static void ReRegisterPullHotkey()
@@ -3111,40 +3120,95 @@ static bool ExecuteBoundAction(int vk, int mods)
     return false;
 }
 
-static spatial::discovery::AttemptResult AddTileCore(HWND hwnd)
+static void CloseCaptureResources(Tile& t)
 {
-    const size_t attemptNumber = ++g_captureAttemptSequence;
-    const std::wstring hwndText = spatial::diagnostics::HexHandle(hwnd);
-    spatial::diagnostics::Log(L"capture.attempt",
-        L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText + L" stage=inspect");
-    Tile t;
-    t.source = hwnd;
-    t.exe = ExeNameOf(hwnd);
-    // M15: kural - dışlanan exe hiç yakalanmaz (CreateTiles + AdoptNewWindows)
+    try
     {
-        std::wstring exeL = t.exe;
-        std::transform(exeL.begin(), exeL.end(), exeL.begin(), ::towlower);
-        if (g_ruleExclude.count(exeL))
+        if (t.pool && t.frameArrivedRegistered)
+            t.pool.FrameArrived(t.frameArrivedToken);
+    }
+    catch (...) {}
+    t.frameArrivedRegistered = false;
+    try { if (t.session) t.session.Close(); } catch (...) {}
+    try { if (t.pool) t.pool.Close(); } catch (...) {}
+    t.session = nullptr;
+    t.pool = nullptr;
+    t.item = nullptr;
+}
+
+static void QueueCaptureCompletion(
+    const std::shared_ptr<CaptureCoordinator>& coordinator,
+    CaptureCompletion&& completion)
+{
+    if (!coordinator || coordinator->closing.load())
+    {
+        CloseCaptureResources(completion.tile);
+        return;
+    }
+    {
+        std::lock_guard lock(coordinator->mutex);
+        coordinator->captures.push_back(std::move(completion));
+    }
+    PostMessageW(g_hwnd, MSG_CAPTURE_COMPLETE, 0, 0);
+}
+
+static void CaptureWindowOnWorker(HWND hwnd,
+    winrt::IDirect3DDevice captureDevice,
+    const std::shared_ptr<CaptureCoordinator>& coordinator)
+{
+    const size_t attemptNumber = g_captureAttemptSequence.fetch_add(1) + 1;
+    const std::wstring hwndText = spatial::diagnostics::HexHandle(hwnd);
+    CaptureCompletion completion;
+    completion.hwnd = hwnd;
+    completion.attemptNumber = attemptNumber;
+    Tile& t = completion.tile;
+    t.source = hwnd;
+
+    spatial::diagnostics::Log(L"capture.attempt",
+        L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+        L" worker=independent stage=inspect");
+
+    if (!IsWindow(hwnd))
+    {
+        HRESULT error = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+        spatial::diagnostics::Log(L"capture.failure",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=inspect HRESULT=" + spatial::diagnostics::HexHRESULT(error) +
+            L" reason=destroyed_before_capture action=skip_and_continue");
+        completion.result = { spatial::discovery::AttemptStatus::Failed, error };
+        QueueCaptureCompletion(coordinator, std::move(completion));
+        return;
+    }
+
+    t.exe = ExeNameOf(hwnd);
+    {
+        std::wstring exeLower = t.exe;
+        std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::towlower);
+        if (g_ruleExclude.count(exeLower))
         {
             spatial::diagnostics::Log(L"capture.skip",
                 L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
                 L" reason=user_rules_exclude process=" + t.exe);
-            return { spatial::discovery::AttemptStatus::Skipped, S_OK };
+            completion.result = { spatial::discovery::AttemptStatus::Skipped, S_OK };
+            QueueCaptureCompletion(coordinator, std::move(completion));
+            return;
         }
-        auto oit = g_ruleOpacity.find(exeL); // M28: saydamlık kuralı
-        if (oit != g_ruleOpacity.end()) t.opacity = oit->second;
-        auto bit = g_ruleBlur.find(exeL);    // M34: blur kuralı
-        if (bit != g_ruleBlur.end()) t.blur = bit->second;
+        auto opacity = g_ruleOpacity.find(exeLower);
+        if (opacity != g_ruleOpacity.end()) t.opacity = opacity->second;
+        auto blur = g_ruleBlur.find(exeLower);
+        if (blur != g_ruleBlur.end()) t.blur = blur->second;
     }
-    t.exePath = ExePathOf(hwnd); // M11: çoğaltma için
-    // M13: dock için uygulama ikonu (paylaşılan handle, sahibi pencere)
+    t.exePath = ExePathOf(hwnd);
     SendMessageTimeoutW(hwnd, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 80,
-        (PDWORD_PTR)&t.icon);
-    if (!t.icon) t.icon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICON);
-    if (!t.icon) t.icon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICONSM);
-    std::wstring captureStage = L"GraphicsCaptureItem.CreateForWindow";
+        reinterpret_cast<PDWORD_PTR>(&t.icon));
+    if (!t.icon) t.icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICON));
+    if (!t.icon) t.icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICONSM));
+
+    std::wstring captureStage = L"worker.winrt.init_apartment";
     try
     {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        captureStage = L"GraphicsCaptureItem.CreateForWindow";
         spatial::diagnostics::Log(L"capture.stage",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" stage=" + captureStage);
@@ -3155,89 +3219,83 @@ static spatial::discovery::AttemptResult AddTileCore(HWND hwnd)
         t.lastSize = t.item.Size();
         if (t.lastSize.Width <= 0 || t.lastSize.Height <= 0)
             winrt::throw_hresult(E_INVALIDARG);
+
         captureStage = L"Direct3D11CaptureFramePool.CreateFreeThreaded";
         spatial::diagnostics::Log(L"capture.stage",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" item_size=" + std::to_wstring(t.lastSize.Width) + L"x" +
             std::to_wstring(t.lastSize.Height) + L" stage=" + captureStage);
         t.pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            g_winrtDevice, winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            captureDevice, winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2, t.lastSize);
         spatial::diagnostics::Log(L"capture.stage",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" stage=Direct3D11CaptureFramePool.CreateFreeThreaded result=success");
+
+        captureStage = L"CaptureFramePool.FrameArrived";
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=CaptureFramePool.FrameArrived action=register");
+        t.frameArrivedToken = t.pool.FrameArrived([](auto const&, auto const&)
+        {
+            bool expected = false;
+            if (g_frameWakePending.compare_exchange_strong(expected, true))
+                PostMessageW(g_hwnd, MSG_CAPTURE_FRAME, 0, 0);
+        });
+        t.frameArrivedRegistered = true;
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=CaptureFramePool.FrameArrived result=registered");
+
         captureStage = L"CaptureFramePool.CreateCaptureSession";
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=CaptureFramePool.CreateCaptureSession action=begin");
         t.session = t.pool.CreateCaptureSession(t.item);
         spatial::diagnostics::Log(L"capture.stage",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" stage=CaptureFramePool.CreateCaptureSession result=success");
-        try
-        {
-            t.session.IsCursorCaptureEnabled(false);
-            spatial::diagnostics::Log(L"capture.option",
-                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-                L" IsCursorCaptureEnabled(false)=success");
-        }
-        catch (winrt::hresult_error const& e)
-        {
-            spatial::diagnostics::Log(L"capture.option",
-                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-                L" IsCursorCaptureEnabled(false)=ignored_failure HRESULT=" +
-                spatial::diagnostics::HexHRESULT(e.code()));
-        }
-        catch (...)
-        {
-            spatial::diagnostics::Log(L"capture.option",
-                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-                L" IsCursorCaptureEnabled(false)=ignored_failure HRESULT=0x80004005");
-        }
-        // NOT: M16'da eklenen IsBorderRequired(false)+IncludeSecondaryWindows(true)
-        // KALDIRILDI - tile'ları siyah bırakıyordu. IsBorderRequired bazı Win
-        // sürümlerinde capture'ı bozuyor (openai/codex #25178); RequestAccessAsync
-        // (Borderless) manifest capability + consent ister, bizde yok. Sarı yakalama
-        // çerçevesi (kozmetik) geri geldi - capture'ın çalışmasından önemsiz.
-        // M4: yakalamayı sınırla (varsayılan 30fps - ayarlardan değişir)
-        try
-        {
-            t.session.MinUpdateInterval(winrt::TimeSpan{
-                std::chrono::milliseconds(1000 / std::max(1, g_set.fpsCap)) });
-        }
-        catch (winrt::hresult_error const& e)
-        {
-            spatial::diagnostics::Log(L"capture.option",
-                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-                L" MinUpdateInterval=ignored_failure HRESULT=" +
-                spatial::diagnostics::HexHRESULT(e.code()));
-        }
-        catch (...)
-        {
-            spatial::diagnostics::Log(L"capture.option",
-                L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-                L" MinUpdateInterval=ignored_failure HRESULT=0x80004005");
-        }
+
+        // Baseline WGC startup intentionally uses no optional session properties.
+        // MinUpdateInterval and cursor/border options can block on some systems and
+        // are not required for capture. Frame rate is enforced by UI-side polling.
         captureStage = L"GraphicsCaptureSession.StartCapture";
+        spatial::diagnostics::Log(L"capture.stage",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" stage=GraphicsCaptureSession.StartCapture action=begin");
         t.session.StartCapture();
         t.captureStartedTick = GetTickCount64();
         spatial::diagnostics::Log(L"capture.started",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-            L" stage=GraphicsCaptureSession.StartCapture result=success");
+            L" stage=GraphicsCaptureSession.StartCapture result=success optional_properties=none");
+        completion.result = { spatial::discovery::AttemptStatus::Captured, S_OK };
     }
-    catch (winrt::hresult_error const& e)
+    catch (winrt::hresult_error const& error)
     {
         spatial::diagnostics::Log(L"capture.failure",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" stage=" + captureStage + L" HRESULT=" +
-            spatial::diagnostics::HexHRESULT(e.code()) +
+            spatial::diagnostics::HexHRESULT(error.code()) +
             L" action=skip_and_continue");
-        return { spatial::discovery::AttemptStatus::Failed, e.code() };
+        CloseCaptureResources(t);
+        completion.result = { spatial::discovery::AttemptStatus::Failed, error.code() };
     }
     catch (...)
     {
         spatial::diagnostics::Log(L"capture.failure",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-            L" stage=" + captureStage + L" HRESULT=0x80004005 action=skip_and_continue");
-        return { spatial::discovery::AttemptStatus::Failed, E_FAIL };
+            L" stage=" + captureStage +
+            L" HRESULT=0x80004005 action=skip_and_continue");
+        CloseCaptureResources(t);
+        completion.result = { spatial::discovery::AttemptStatus::Failed, E_FAIL };
     }
+    QueueCaptureCompletion(coordinator, std::move(completion));
+}
+
+static void FinalizeCapturedTile(Tile&& captured, size_t attemptNumber)
+{
+    Tile t = std::move(captured);
+    const std::wstring hwndText = spatial::diagnostics::HexHandle(t.source);
     t.ww = (float)t.lastSize.Width;
     t.wh = (float)t.lastSize.Height;
     // Konum: yapıştırma slotu > kayıtlı layout > mevcut kümenin sağı
@@ -3303,72 +3361,200 @@ static spatial::discovery::AttemptResult AddTileCore(HWND hwnd)
     g_tiles.push_back(std::move(t));
     ParkWindow(g_tiles.back(), (int)g_tiles.size() - 1);
     spatial::diagnostics::Log(L"lifecycle.park",
-        L"hwnd=" + hwndText + L" result=success tile_index=" +
+        L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+        L" result=success tile_index=" +
         std::to_wstring(g_tiles.size() - 1));
     SaveLayout();
-    return { spatial::discovery::AttemptStatus::Captured, S_OK };
 }
 
-static spatial::discovery::AttemptResult AddTile(HWND hwnd)
+static void RecordCaptureCompletion(CaptureCompletion&& completion)
 {
-    const size_t tilesBefore = g_tiles.size();
+    g_capturePending.erase(completion.hwnd);
+    switch (completion.result.status)
+    {
+    case spatial::discovery::AttemptStatus::Captured:
+    {
+        const size_t tilesBefore = g_tiles.size();
+        try
+        {
+            if (!IsWindow(completion.hwnd))
+                winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
+            bool duplicate = false;
+            for (const auto& tile : g_tiles)
+                if (tile.source == completion.hwnd) { duplicate = true; break; }
+            if (duplicate)
+            {
+                CloseCaptureResources(completion.tile);
+                return;
+            }
+            const bool firstTile = g_tiles.empty();
+            FinalizeCapturedTile(std::move(completion.tile), completion.attemptNumber);
+            ++g_diag.capturesStarted;
+            if (firstTile && !g_hasSavedCam && !g_spacesLoaded) FitCamera(true);
+        }
+        catch (winrt::hresult_error const& error)
+        {
+            if (g_tiles.size() > tilesBefore)
+            {
+                RestoreOriginal(g_tiles.back());
+                RemoveTileAt(static_cast<int>(g_tiles.size() - 1), false);
+            }
+            else CloseCaptureResources(completion.tile);
+            ++g_diag.captureFailures;
+            if (g_diag.firstCaptureHr == S_OK) g_diag.firstCaptureHr = error.code();
+            spatial::diagnostics::Log(L"capture.failure",
+                L"attempt=" + std::to_wstring(completion.attemptNumber) +
+                L" hwnd=" + spatial::diagnostics::HexHandle(completion.hwnd) +
+                L" stage=ui_finalize HRESULT=" +
+                spatial::diagnostics::HexHRESULT(error.code()) +
+                L" action=cleanup_skip_and_continue");
+        }
+        catch (...)
+        {
+            if (g_tiles.size() > tilesBefore)
+            {
+                RestoreOriginal(g_tiles.back());
+                RemoveTileAt(static_cast<int>(g_tiles.size() - 1), false);
+            }
+            else CloseCaptureResources(completion.tile);
+            ++g_diag.captureFailures;
+            if (g_diag.firstCaptureHr == S_OK) g_diag.firstCaptureHr = E_FAIL;
+            spatial::diagnostics::Log(L"capture.failure",
+                L"attempt=" + std::to_wstring(completion.attemptNumber) +
+                L" hwnd=" + spatial::diagnostics::HexHandle(completion.hwnd) +
+                L" stage=ui_finalize HRESULT=0x80004005 action=cleanup_skip_and_continue");
+        }
+        break;
+    }
+    case spatial::discovery::AttemptStatus::Skipped:
+        ++g_diag.userRuleSkipped;
+        break;
+    case spatial::discovery::AttemptStatus::Failed:
+        ++g_diag.captureFailures;
+        if (g_diag.firstCaptureHr == S_OK)
+            g_diag.firstCaptureHr = FAILED(completion.result.error) ? completion.result.error : E_FAIL;
+        break;
+    }
+}
+
+static void DrainCaptureCompletions()
+{
+    if (!g_captureCoordinator) return;
+    std::deque<CaptureCompletion> completed;
+    {
+        std::lock_guard lock(g_captureCoordinator->mutex);
+        completed.swap(g_captureCoordinator->captures);
+    }
+    for (auto& completion : completed)
+        RecordCaptureCompletion(std::move(completion));
+
+    if (!completed.empty())
+    {
+        spatial::diagnostics::Log(L"capture.progress",
+            L"attempts=" + std::to_wstring(g_diag.attempts) +
+            L" completed=" + std::to_wstring(g_diag.capturesStarted +
+                g_diag.captureFailures + g_diag.userRuleSkipped) +
+            L" pending=" + std::to_wstring(g_capturePending.size()) +
+            L" started=" + std::to_wstring(g_diag.capturesStarted) +
+            L" failures=" + std::to_wstring(g_diag.captureFailures) +
+            L" skipped=" + std::to_wstring(g_diag.userRuleSkipped));
+    }
+}
+
+static void StartCaptureAttempts(const std::vector<HWND>& windows)
+{
+    std::vector<HWND> pending;
+    for (HWND hwnd : windows)
+    {
+        if (g_excluded.count(hwnd) || g_captureScheduled.count(hwnd)) continue;
+        bool known = false;
+        for (const auto& tile : g_tiles)
+            if (tile.source == hwnd) { known = true; break; }
+        if (known) continue;
+        g_captureScheduled.insert(hwnd);
+        g_capturePending.insert(hwnd);
+        pending.push_back(hwnd);
+    }
+    if (pending.empty()) return;
+
+    g_diag.attempts += pending.size();
+    auto coordinator = g_captureCoordinator;
+    auto captureDevice = g_winrtDevice;
+    auto dispatch = spatial::discovery::DispatchWindowAttemptsIndependently(
+        pending,
+        [captureDevice, coordinator](HWND hwnd) {
+            CaptureWindowOnWorker(hwnd, captureDevice, coordinator);
+        },
+        [coordinator](HWND hwnd, HRESULT error) {
+            const size_t attemptNumber = g_captureAttemptSequence.fetch_add(1) + 1;
+            spatial::diagnostics::Log(L"capture.failure",
+                L"attempt=" + std::to_wstring(attemptNumber) +
+                L" hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
+                L" stage=worker_dispatch HRESULT=" +
+                spatial::diagnostics::HexHRESULT(error) +
+                L" action=skip_and_continue");
+            CaptureCompletion failed;
+            failed.hwnd = hwnd;
+            failed.attemptNumber = attemptNumber;
+            failed.result = { spatial::discovery::AttemptStatus::Failed, error };
+            QueueCaptureCompletion(coordinator, std::move(failed));
+        });
+    spatial::diagnostics::Log(L"capture.dispatch",
+        L"candidates=" + std::to_wstring(dispatch.discovered) +
+        L" independent_workers=" + std::to_wstring(dispatch.dispatched) +
+        L" dispatch_failures=" + std::to_wstring(dispatch.dispatchFailures) +
+        L" capture_limit=none ui_thread_blocked=false");
+}
+
+static void StartDiscoveryAsync(bool initial)
+{
+    bool expected = false;
+    if (!g_discoveryInFlight.compare_exchange_strong(expected, true)) return;
+    auto coordinator = g_captureCoordinator;
     try
     {
-        return AddTileCore(hwnd);
-    }
-    catch (winrt::hresult_error const& e)
-    {
-        spatial::diagnostics::Log(L"capture.failure",
-            L"hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
-            L" stage=post_capture_tile_setup HRESULT=" +
-            spatial::diagnostics::HexHRESULT(e.code()) + L" action=cleanup_skip_and_continue");
-        if (g_tiles.size() > tilesBefore)
+        std::thread([coordinator, initial]
         {
-            RestoreOriginal(g_tiles.back());
-            RemoveTileAt(static_cast<int>(g_tiles.size() - 1), false);
-        }
-        return { spatial::discovery::AttemptStatus::Failed, e.code() };
+            DiscoveryCompletion completion;
+            completion.initial = initial;
+            completion.enumeration = EnumerateCaptureCandidates(initial);
+            if (!coordinator || coordinator->closing.load()) return;
+            {
+                std::lock_guard lock(coordinator->mutex);
+                coordinator->discoveries.push_back(std::move(completion));
+            }
+            PostMessageW(g_hwnd, MSG_DISCOVERY_COMPLETE, 0, 0);
+        }).detach();
+        spatial::diagnostics::Log(L"enumeration.dispatch",
+            std::wstring(L"initial=") + (initial ? L"true" : L"false") +
+            L" worker=independent ui_thread_blocked=false");
     }
     catch (...)
     {
-        spatial::diagnostics::Log(L"capture.failure",
-            L"hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
-            L" stage=post_capture_tile_setup HRESULT=0x80004005 action=cleanup_skip_and_continue");
-        if (g_tiles.size() > tilesBefore)
-        {
-            RestoreOriginal(g_tiles.back());
-            RemoveTileAt(static_cast<int>(g_tiles.size() - 1), false);
-        }
-        return { spatial::discovery::AttemptStatus::Failed, E_FAIL };
+        g_discoveryInFlight = false;
+        spatial::diagnostics::Log(L"enumeration.failure",
+            L"stage=worker_dispatch HRESULT=0x8007000E action=canvas_remains_running");
     }
 }
 
-static void CreateTiles()
+static void DrainDiscoveryCompletions()
 {
-    g_diag = {};
-    g_captureAttemptSequence = 0;
-    g_captureStartupTick = GetTickCount64();
-    g_noFrameNoticeShown = false;
-
-    EnumerationContext enumeration = EnumerateCaptureCandidates(true);
-    g_diag = enumeration.diagnostics;
-    auto summary = spatial::discovery::ProcessWindowAttempts(
-        enumeration.windows, static_cast<size_t>(std::max(0, g_set.maxTiles)),
-        [](HWND hwnd) { return AddTile(hwnd); });
-    g_diag.attempts = summary.attempted;
-    g_diag.capturesStarted = summary.captured;
-    g_diag.captureFailures = summary.failed;
-    g_diag.userRuleSkipped = summary.skipped;
-    g_diag.firstCaptureHr = summary.firstFailure;
-
-    spatial::diagnostics::Log(L"capture.summary",
-        L"candidates=" + std::to_wstring(g_diag.candidates) +
-        L" attempts=" + std::to_wstring(g_diag.attempts) +
-        L" started=" + std::to_wstring(g_diag.capturesStarted) +
-        L" failures=" + std::to_wstring(g_diag.captureFailures) +
-        L" user_rule_skips=" + std::to_wstring(g_diag.userRuleSkipped) +
-        L" first_failure=" + spatial::diagnostics::HexHRESULT(g_diag.firstCaptureHr) +
-        L" max_tiles=" + std::to_wstring(g_set.maxTiles));
+    if (!g_captureCoordinator) return;
+    std::deque<DiscoveryCompletion> completed;
+    {
+        std::lock_guard lock(g_captureCoordinator->mutex);
+        completed.swap(g_captureCoordinator->discoveries);
+    }
+    for (auto& completion : completed)
+    {
+        g_discoveryInFlight = false;
+        if (completion.initial)
+        {
+            g_diag = completion.enumeration.diagnostics;
+            g_initialDiscoveryCompleted = true;
+        }
+        StartCaptureAttempts(completion.enumeration.windows);
+    }
 }
 
 static void FitCamera(bool ignoreSel)
@@ -3884,6 +4070,77 @@ static bool UpdateTiles()
     return any;
 }
 
+static void MaybeReportStartupIssue()
+{
+    if (g_startupIssueReported || !g_initialDiscoveryCompleted || !g_tiles.empty()) return;
+
+    const size_t completed = g_diag.capturesStarted + g_diag.captureFailures +
+        g_diag.userRuleSkipped;
+    const ULONGLONG elapsed = GetTickCount64() - g_captureStartupTick;
+    const bool allAttemptsReturned = completed >= g_diag.attempts && g_capturePending.empty();
+    if (!allAttemptsReturned && elapsed < 10000) return;
+
+    g_startupIssueReported = true;
+    std::wstring reason;
+    if (spatial::diagnostics::DesktopMismatchDetected())
+        reason = L"The process desktop does not match the interactive input desktop.";
+    else if (!g_diag.enumWindowsResult &&
+        (!g_diag.desktopFallbackUsed || !g_diag.enumDesktopResult))
+        reason = L"Window enumeration APIs failed.";
+    else if (g_diag.enumWindowsCallbacks + g_diag.enumDesktopCallbacks == 0)
+        reason = L"Window enumeration returned no HWNDs.";
+    else if (g_diag.candidates == 0)
+        reason = L"Windows were enumerated, but all were structurally skipped.";
+    else if (!g_capturePending.empty())
+        reason = L"One or more per-window capture API calls did not return. "
+            L"The Canvas and later window attempts remain active.";
+    else if (g_diag.userRuleSkipped == g_diag.attempts && g_diag.attempts > 0)
+        reason = L"All candidates were excluded by the user's rules.txt.";
+    else if (g_diag.captureFailures > 0)
+        reason = L"Capture was attempted for every candidate, but all attempts failed.";
+    else
+        reason = L"Candidates existed, but no capture session was started.";
+
+    std::wstring details =
+        L"reason=" + reason +
+        L" callbacks=" + std::to_wstring(g_diag.enumWindowsCallbacks +
+            g_diag.enumDesktopCallbacks) +
+        L" candidates=" + std::to_wstring(g_diag.candidates) +
+        L" attempts=" + std::to_wstring(g_diag.attempts) +
+        L" completed=" + std::to_wstring(completed) +
+        L" pending_or_hung=" + std::to_wstring(g_capturePending.size()) +
+        L" failures=" + std::to_wstring(g_diag.captureFailures) +
+        L" first_failure=" + spatial::diagnostics::HexHRESULT(g_diag.firstCaptureHr) +
+        L" elapsed_ms=" + std::to_wstring(elapsed);
+    spatial::diagnostics::Log(L"startup.no_tiles", details);
+
+    std::wstring message = reason +
+        L"\n\nCapture candidates: " + std::to_wstring(g_diag.candidates) +
+        L"\nCapture attempts dispatched: " + std::to_wstring(g_diag.attempts) +
+        L"\nAttempts completed: " + std::to_wstring(completed) +
+        L"\nPending or hung attempts: " + std::to_wstring(g_capturePending.size()) +
+        L"\nCapture failures: " + std::to_wstring(g_diag.captureFailures) +
+        L"\nFirst capture HRESULT: " + spatial::diagnostics::HexHRESULT(g_diag.firstCaptureHr) +
+        L"\n\nSpatial Canvas will keep running. See SpatialCanvas-debug.log beside the executable.";
+    MessageBoxW(g_hwnd, message.c_str(), L"Spatial Canvas - Capture status",
+        MB_OK | MB_ICONWARNING);
+}
+
+static void MaybeLogHungCaptureAttempts()
+{
+    if (g_hungAttemptsLogged || !g_initialDiscoveryCompleted || g_capturePending.empty()) return;
+    const ULONGLONG elapsed = GetTickCount64() - g_captureStartupTick;
+    if (elapsed < 10000) return;
+    g_hungAttemptsLogged = true;
+    for (HWND hwnd : g_capturePending)
+    {
+        spatial::diagnostics::Log(L"capture.hung",
+            L"hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
+            L" elapsed_ms=" + std::to_wstring(elapsed) +
+            L" state=worker_still_pending action=other_windows_continue");
+    }
+}
+
 static void MaybeWarnNoFrames()
 {
     if (g_noFrameNoticeShown || !g_captureStartupTick ||
@@ -3931,8 +4188,7 @@ static void RemoveTileAt(int i, bool restoreWindow)
     if (g_focusWnd == t.source) g_focusWnd = nullptr; // M21: odaktan düş
     // pozisyonu hatırla: aynı exe yeniden açılırsa yerine düşsün
     g_savedLayout.push_back({ t.exe, POINT{ (LONG)t.wx, (LONG)t.wy } });
-    try { if (t.session) t.session.Close(); } catch (...) {}
-    try { if (t.pool) t.pool.Close(); } catch (...) {}
+    CloseCaptureResources(t);
     g_tiles.erase(g_tiles.begin() + i);
     SavePendingRestore();
 }
@@ -3992,31 +4248,7 @@ static void AdoptNewWindows()
     ULONGLONG now = GetTickCount64();
     if (now - g_lastAdopt < 1500) return;
     g_lastAdopt = now;
-    EnumerationContext enumeration = EnumerateCaptureCandidates(false);
-    for (HWND w : enumeration.windows)
-    {
-        if (g_excluded.count(w)) continue; // serbest bırakılanlar kapılmaz (M6)
-        bool known = false;
-        for (auto& t : g_tiles) if (t.source == w) { known = true; break; }
-        if (!known)
-        {
-            // M17: sınır doluyken yeni pencere SESSİZCE yutulmasın -
-            // kullanıcı bunu yakalama hatası sanıyordu (30sn'de bir uyar)
-            if ((int)g_tiles.size() >= g_set.maxTiles)
-            {
-                static ULONGLONG s_lastCapToast = 0;
-                if (now - s_lastCapToast > 30000)
-                {
-                    s_lastCapToast = now;
-                    ShowToast(TL(L"Window limit reached (", L"Pencere sınırı dolu (") +
-                        std::to_wstring(g_set.maxTiles) +
-                        TL(L") — Settings > Max windows", L") — Ayarlar > Maks. pencere"));
-                }
-                break;
-            }
-            AddTile(w);
-        }
-    }
+    StartDiscoveryAsync(false);
 }
 
 // ---- Render ----
@@ -4127,9 +4359,7 @@ static void HandleDeviceLost()
     // 1) Cihaza bağlı TÜM kaynakları bırak (com_ptr.put() null ister)
     for (auto& t : g_tiles)
     {
-        try { if (t.session) t.session.Close(); } catch (...) {}
-        try { if (t.pool) t.pool.Close(); } catch (...) {}
-        t.session = nullptr; t.pool = nullptr; t.item = nullptr;
+        CloseCaptureResources(t);
         t.tex = nullptr; t.srv = nullptr; t.icoBmp = nullptr;
     }
     for (auto& l : g_launchers) l.icoBmp = nullptr; // M24: device-lost'ta launcher ikonları
@@ -4163,10 +4393,14 @@ static void HandleDeviceLost()
                     t.pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
                         g_winrtDevice, winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                         2, t.lastSize);
+                    t.frameArrivedToken = t.pool.FrameArrived([](auto const&, auto const&)
+                    {
+                        bool expected = false;
+                        if (g_frameWakePending.compare_exchange_strong(expected, true))
+                            PostMessageW(g_hwnd, MSG_CAPTURE_FRAME, 0, 0);
+                    });
+                    t.frameArrivedRegistered = true;
                     t.session = t.pool.CreateCaptureSession(t.item);
-                    try { t.session.IsCursorCaptureEnabled(false); } catch (...) {}
-                    try { t.session.MinUpdateInterval(winrt::TimeSpan{
-                        std::chrono::milliseconds(1000 / std::max(1, g_set.fpsCap)) }); } catch (...) {}
                     t.session.StartCapture();
                     t.alive = true;
                 }
@@ -5571,6 +5805,16 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case MSG_DISCOVERY_COMPLETE:
+        DrainDiscoveryCompletions();
+        return 0;
+    case MSG_CAPTURE_COMPLETE:
+        DrainCaptureCompletions();
+        return 0;
+    case MSG_CAPTURE_FRAME:
+        g_frameWakePending = false;
+        g_frameWakeRequested = true;
+        return 0;
     case WM_HOTKEY:
         if (wp == HOTKEY_TOGGLE)
         {
@@ -6028,45 +6272,20 @@ int RunCanvasApp()
 
     InitD3D();
     InitD2D();
-    CreateTiles();
-    if (g_tiles.empty())
-    {
-        bool wgcSupported = false;
-        try { wgcSupported = winrt::GraphicsCaptureSession::IsSupported(); } catch (...) {}
-        std::wstring reason;
-        if (!wgcSupported)
-            reason = L"Windows.Graphics.Capture is unavailable.";
-        else if (spatial::diagnostics::DesktopMismatchDetected())
-            reason = L"The process desktop does not match the interactive input desktop.";
-        else if (!g_diag.enumWindowsResult &&
-            (!g_diag.desktopFallbackUsed || !g_diag.enumDesktopResult))
-            reason = L"Window enumeration APIs failed.";
-        else if (g_diag.enumWindowsCallbacks + g_diag.enumDesktopCallbacks == 0)
-            reason = L"Window enumeration returned no HWNDs.";
-        else if (g_diag.candidates == 0)
-            reason = L"Windows were enumerated, but all were structurally skipped.";
-        else if (g_diag.attempts > 0 && g_diag.captureFailures > 0)
-            reason = L"Capture was attempted, but every attempted window failed.";
-        else if (g_diag.userRuleSkipped == g_diag.attempts && g_diag.attempts > 0)
-            reason = L"All candidates were excluded by the user's rules.txt.";
-        else
-            reason = L"Candidates existed, but no capture session was started.";
+    g_captureCoordinator = std::make_shared<CaptureCoordinator>();
+    g_diag = {};
+    g_captureAttemptSequence = 0;
+    g_captureScheduled.clear();
+    g_capturePending.clear();
+    g_discoveryInFlight = false;
+    g_frameWakePending = false;
+    g_frameWakeRequested = false;
+    g_captureStartupTick = GetTickCount64();
+    g_noFrameNoticeShown = false;
+    g_initialDiscoveryCompleted = false;
+    g_startupIssueReported = false;
+    g_hungAttemptsLogged = false;
 
-        std::wstring message = reason +
-            L"\n\nEnumWindows callbacks: " + std::to_wstring(g_diag.enumWindowsCallbacks) +
-            L"\nEnumDesktopWindows callbacks: " + std::to_wstring(g_diag.enumDesktopCallbacks) +
-            L"\nUnique HWNDs observed: " + std::to_wstring(g_diag.uniqueWindows) +
-            L"\nCapture candidates: " + std::to_wstring(g_diag.candidates) +
-            L"\nCapture attempts: " + std::to_wstring(g_diag.attempts) +
-            L"\nCapture failures: " + std::to_wstring(g_diag.captureFailures) +
-            L"\nFirst capture HRESULT: " + spatial::diagnostics::HexHRESULT(g_diag.firstCaptureHr) +
-            L"\n\nSee SpatialCanvas-debug.log beside SpatialCanvas.exe for complete details.";
-        spatial::diagnostics::Log(L"startup.no_tiles", L"reason=" + reason);
-        MessageBoxW(nullptr, message.c_str(), L"Spatial Canvas - No captured windows",
-            MB_OK | MB_ICONWARNING);
-        return 1;
-    }
-    ReconcileConnectors(); // M75: yüklenen bağlayıcıları açık pencerelere bağla
     // M73 Slice 3: Spaces yüklendiyse aktif tuvalın kendi kamerası öncelikli
     if (g_spacesLoaded && g_activeSpace < (int)g_spaces.size()
         && g_spaces[g_activeSpace].cam.zoom > 0.001f)
@@ -6087,6 +6306,8 @@ int RunCanvasApp()
     else FitCamera();
     ShowWindow(g_hwnd, SW_SHOW);
     RaiseCanvasTopmost(); // M11: tuval görev çubuğunun üstünde başlar
+    spatial::diagnostics::Log(L"canvas.window",
+        L"ShowWindow(SW_SHOW) completed; entering responsive UI before discovery/capture");
 
     // M2: global hotkey + global Ctrl+Alt+Wheel hook
     ReRegisterPullHotkey(); // M8: ayarlı global geri-çekil kısayolu
@@ -6097,6 +6318,9 @@ int RunCanvasApp()
             L"SetWindowsHookExW failed Win32Error=" + std::to_wstring(GetLastError()));
     else
         spatial::diagnostics::Log(L"input.mouse_hook", L"WH_MOUSE_LL installed");
+
+    // Discovery and every WGC setup run away from this UI/message-pump thread.
+    StartDiscoveryAsync(true);
 
     MSG msg{};
     g_lastTick = GetTickCount64();
@@ -6135,6 +6359,8 @@ int RunCanvasApp()
         if (g_deviceLost) { HandleDeviceLost(); dirty = true; }
         // M3: yaşam döngüsü + kamera animasyonu
         size_t tilesBefore = g_tiles.size();
+        DrainDiscoveryCompletions();
+        DrainCaptureCompletions();
         SweepDeadTiles();
         AdoptNewWindows();
         if (g_tiles.size() != tilesBefore)
@@ -6250,7 +6476,17 @@ int RunCanvasApp()
         }
         // M17: toast animasyonu sürerken çiz
         if (!g_toast.empty() && GetTickCount64() - g_toastTick < 1600) dirty = true;
-        if (UpdateTiles()) dirty = true; // M19: yeni kare/başlık geldi
+        static ULONGLONG lastFramePoll = 0;
+        ULONGLONG frameNow = GetTickCount64();
+        ULONGLONG frameInterval = 1000 / static_cast<ULONGLONG>(std::max(1, g_set.fpsCap));
+        if (g_frameWakeRequested || frameNow - lastFramePoll >= frameInterval)
+        {
+            g_frameWakeRequested = false;
+            lastFramePoll = frameNow;
+            if (UpdateTiles()) dirty = true; // M19: yeni kare/başlık geldi
+        }
+        MaybeLogHungCaptureAttempts();
+        MaybeReportStartupIssue();
         MaybeWarnNoFrames();
         if (dirty)
             Render();
@@ -6263,13 +6499,23 @@ int RunCanvasApp()
     }
 done:
     spatial::diagnostics::Log(L"shutdown", L"message loop ending; restoring windows");
+    if (g_captureCoordinator)
+    {
+        g_captureCoordinator->closing = true;
+        std::deque<CaptureCompletion> abandoned;
+        {
+            std::lock_guard lock(g_captureCoordinator->mutex);
+            abandoned.swap(g_captureCoordinator->captures);
+            g_captureCoordinator->discoveries.clear();
+        }
+        for (auto& completion : abandoned) CloseCaptureResources(completion.tile);
+    }
     // M2 temizlik: hook/hotkey kaldır, TÜM pencereleri orijinal yerine koy
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
     UnregisterHotKey(g_hwnd, HOTKEY_TOGGLE);
     for (auto& t : g_tiles)
     {
-        try { if (t.session) t.session.Close(); } catch (...) {}
-        try { if (t.pool) t.pool.Close(); } catch (...) {}
+        CloseCaptureResources(t);
         RestoreOriginal(t);
     }
     ShowTaskbars(true); // M11: çıkışta görev çubuğu garantili görünür

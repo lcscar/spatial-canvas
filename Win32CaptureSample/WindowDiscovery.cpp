@@ -1,6 +1,7 @@
 #include "WindowDiscovery.h"
 
 #include <cwchar>
+#include <thread>
 
 namespace spatial::discovery
 {
@@ -43,7 +44,6 @@ namespace spatial::discovery
 
     AttemptSummary ProcessWindowAttempts(
         const std::vector<HWND>& windows,
-        size_t maximumSuccessfulCaptures,
         const AttemptWindow& attempt)
     {
         AttemptSummary summary;
@@ -51,8 +51,6 @@ namespace spatial::discovery
 
         for (HWND hwnd : windows)
         {
-            if (summary.captured >= maximumSuccessfulCaptures) break;
-
             AttemptResult result;
             ++summary.attempted;
             try
@@ -81,5 +79,69 @@ namespace spatial::discovery
         }
 
         return summary;
+    }
+
+    DispatchSummary DispatchWindowAttemptsIndependently(
+        const std::vector<HWND>& windows,
+        const IndependentAttempt& attempt,
+        const DispatchFailure& failure)
+    {
+        DispatchSummary summary;
+        summary.discovered = windows.size();
+
+        for (HWND hwnd : windows)
+        {
+            try
+            {
+                std::thread([hwnd, attempt, failure]
+                {
+                    try
+                    {
+                        attempt(hwnd);
+                    }
+                    catch (...)
+                    {
+                        if (failure) failure(hwnd, E_FAIL);
+                    }
+                }).detach();
+                ++summary.dispatched;
+            }
+            catch (...)
+            {
+                ++summary.dispatchFailures;
+                if (failure) failure(hwnd, E_OUTOFMEMORY);
+            }
+        }
+
+        return summary;
+    }
+
+    CaptureStartupResult ExecuteCaptureStartup(
+        const CaptureStartupStep& optionalConfiguration,
+        const CaptureStartupStep& startCapture)
+    {
+        CaptureStartupResult result;
+        if (optionalConfiguration)
+        {
+            try
+            {
+                result.optionalConfiguration = optionalConfiguration();
+            }
+            catch (...)
+            {
+                result.optionalConfiguration = E_FAIL;
+            }
+        }
+
+        if (!startCapture) return result;
+        try
+        {
+            result.startCapture = startCapture();
+        }
+        catch (...)
+        {
+            result.startCapture = E_FAIL;
+        }
+        return result;
     }
 }
