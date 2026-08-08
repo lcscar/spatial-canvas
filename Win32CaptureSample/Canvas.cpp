@@ -122,7 +122,7 @@ struct Settings
     bool restoreView = true; // M50: açılışta son kamera görünümünü geri yükle
     bool updateCheck = false; // Corporate-safe: network update checks are disabled
     // M48: sürüm feed'i (raw VERSION dosyası, içerik "0.47.0"). HTTP/HTTPS (WinINet).
-    std::wstring updateUrl = L"https://raw.githubusercontent.com/13auth/spatial-canvas/main/VERSION";
+    std::wstring updateUrl; // Corporate-safe: external update URL removed
     std::wstring lastRun; // M53: son çalıştırılan sürüm (güncelleme-sonrası bildirim)
     int fpsCap = 30;        // 15 / 30 / 60
     int animSpeed = 1;      // 0 yavaş, 1 normal, 2 hızlı
@@ -2322,17 +2322,10 @@ static HICON ExtractExeIcon(const std::wstring& exe)
     {
         if (SearchPathW(nullptr, path.c_str(), L".exe", MAX_PATH, full, nullptr))
             path = full;
-        else // App Paths: HKLM sonra HKCU
+        else
         {
-            std::wstring key = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\" + path;
-            wchar_t val[MAX_PATH]; DWORD sz = sizeof(val);
-            if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), nullptr,
-                    RRF_RT_REG_SZ, nullptr, val, &sz) == ERROR_SUCCESS)
-                path = val;
-            else { sz = sizeof(val);
-                if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), nullptr,
-                        RRF_RT_REG_SZ, nullptr, val, &sz) == ERROR_SUCCESS)
-                    path = val; }
+            // Corporate-safe: do not query HKLM/HKCU App Paths.
+            // Explicit paths and normal executable resolution remain available.
         }
     }
     // keskin: sistem ikon indeksi + SHIL_JUMBO (256px) image-list
@@ -4736,15 +4729,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         // M51: yeni-sürüm pill'ine tık → release sayfasını tarayıcıda aç (sadece bildirim)
-        if (g_updateAvail && g_updateRect.right > g_updateRect.left &&
-            cp.x >= g_updateRect.left && cp.x <= g_updateRect.right &&
-            cp.y >= g_updateRect.top && cp.y <= g_updateRect.bottom)
-        {
-            ShellExecuteW(nullptr, L"open",
-                L"https://github.com/13auth/spatial-canvas/releases/latest",
-                nullptr, nullptr, SW_SHOWNORMAL);
-            return 0;
-        }
+        // Corporate-safe: external update/release navigation removed.
         // M22: pinned tile sürükleme (ekran-uzayı; tuval içeriğinden önce)
         int phit = HitPinned(cp);
         if (phit >= 0)
