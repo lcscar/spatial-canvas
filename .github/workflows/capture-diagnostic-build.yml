@@ -1,0 +1,88 @@
+name: Capture diagnostic Windows x64 build
+
+on:
+  push:
+    branches:
+      - hardening/corporate-safe
+    paths:
+      - .github/workflows/capture-diagnostic-build.yml
+      - tools/add_capture_diagnostics.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SOLUTION: Win32CaptureSample.sln
+  CONFIGURATION: Release
+  PLATFORM: x64
+
+jobs:
+  diagnose-and-build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout hardened branch
+        uses: actions/checkout@v4
+        with:
+          ref: hardening/corporate-safe
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Add capture diagnostics
+        shell: pwsh
+        run: python tools/add_capture_diagnostics.py
+
+      - name: Verify corporate-safe source contract
+        shell: pwsh
+        run: python tools/verify_corporate_hardening.py
+
+      - name: Check patch whitespace
+        shell: pwsh
+        run: git diff --check
+
+      - name: Commit diagnostic source back to branch
+        shell: pwsh
+        run: |
+          if (-not (git diff --quiet)) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Win32CaptureSample/Canvas.cpp
+            git commit -m "diagnostics: expose WGC capture failure details"
+            git push origin HEAD:hardening/corporate-safe
+          } else {
+            Write-Host "No source changes required."
+          }
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: nuget restore $env:SOLUTION -NonInteractive
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        shell: pwsh
+        run: msbuild $env:SOLUTION /m /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM /v:minimal
+
+      - name: Verify executable and calculate SHA256
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "x64\Release\SpatialCanvas.exe"
+          if (-not (Test-Path $exe)) { throw "SpatialCanvas.exe was not produced" }
+          Get-Item $exe | Format-List FullName,Length
+          Get-FileHash $exe -Algorithm SHA256
+
+      - name: Upload diagnostic executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpatialCanvas-corporate-safe-x64-diagnostic
+          path: x64/Release/SpatialCanvas.exe
+          if-no-files-found: error
+          retention-days: 7
