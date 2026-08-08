@@ -6,8 +6,12 @@ on:
     branches:
       - hardening/corporate-safe
 
+concurrency:
+  group: corporate-safe-release-x64
+  cancel-in-progress: false
+
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -55,3 +59,35 @@ jobs:
           path: x64/Release/SpatialCanvas.exe
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish executable-only distribution branch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'x64\Release\SpatialCanvas.exe'
+          if (-not (Test-Path $exe)) { throw "Missing build output: $exe" }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin refs/heads/release/exe-only:refs/remotes/origin/release/exe-only
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch release/exe-only' }
+
+          $blob = git hash-object -w $exe
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create executable blob' }
+          $treeLine = "100644 blob $blob`tSpatialCanvas.exe"
+          $tree = $treeLine | git mktree
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create executable-only tree' }
+          $parent = git rev-parse refs/remotes/origin/release/exe-only
+          $message = "Automated Release x64 from $env:GITHUB_SHA"
+          $commit = $message | git commit-tree $tree -p $parent
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create distribution commit' }
+
+          $files = @(git ls-tree -r --name-only $commit)
+          if ($files.Count -ne 1 -or $files[0] -ne 'SpatialCanvas.exe') {
+            throw "Distribution tree must contain only SpatialCanvas.exe: $files"
+          }
+          git push origin "${commit}:refs/heads/release/exe-only"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish release/exe-only' }
+
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Published release/exe-only commit=$commit sha256=$hash"

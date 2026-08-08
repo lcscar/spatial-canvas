@@ -8,6 +8,7 @@ MANIFEST = SOURCE_DIR / "app.manifest"
 DISCOVERY = SOURCE_DIR / "WindowDiscovery.cpp"
 DIAGNOSTICS = SOURCE_DIR / "Diagnostics.cpp"
 CANVAS = SOURCE_DIR / "Canvas.cpp"
+BUILD_WORKFLOW = ROOT / ".github" / "workflows" / "corporate-safe-build.yml"
 
 runtime_files = sorted(
     list(SOURCE_DIR.glob("*.cpp"))
@@ -20,6 +21,7 @@ manifest = MANIFEST.read_text(encoding="utf-8-sig")
 discovery = DISCOVERY.read_text(encoding="utf-8-sig")
 diagnostics = DIAGNOSTICS.read_text(encoding="utf-8-sig")
 canvas = CANVAS.read_text(encoding="utf-8-sig")
+build_workflow = BUILD_WORKFLOW.read_text(encoding="utf-8-sig")
 
 forbidden_case_sensitive = {
     "WinINet header": "#include <wininet.h>",
@@ -115,6 +117,15 @@ start_discovery = canvas.find("StartDiscoveryAsync(true)")
 if show_canvas < 0 or start_discovery < 0 or show_canvas > start_discovery:
     errors.append("STARTUP: Canvas must be shown before asynchronous discovery begins")
 
+for needle in (
+    "contents: write",
+    "Publish executable-only distribution branch",
+    "refs/heads/release/exe-only",
+    "git mktree",
+):
+    if needle not in build_workflow:
+        errors.append(f"DELIVERY: automated executable-only publish is missing: {needle}")
+
 if errors:
     print("Corporate-safe verification FAILED")
     for error in errors:
@@ -129,4 +140,5 @@ print(" - no screenshot/frame export path")
 print(" - debug log is executable-adjacent UTF-8 and title-content safe")
 print(" - broad discovery, independent per-HWND workers, and no capture ceiling are enforced")
 print(" - optional WGC session properties are absent from the startup path")
+print(" - successful Release builds publish only SpatialCanvas.exe to release/exe-only")
 print(" - manifest explicitly uses asInvoker / uiAccess=false")
