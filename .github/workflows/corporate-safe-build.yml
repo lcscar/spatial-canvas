@@ -1,0 +1,57 @@
+name: Corporate-safe Windows x64 build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - hardening/corporate-safe
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout hardened branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify corporate-safe source contract
+        shell: pwsh
+        run: python tools/verify_corporate_hardening.py
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: nuget restore Win32CaptureSample.sln -PackagesDirectory packages -NonInteractive
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        shell: pwsh
+        run: msbuild Win32CaptureSample.sln /m /v:minimal /p:Configuration=Release /p:Platform=x64
+
+      - name: Verify executable exists
+        shell: pwsh
+        run: |
+          $exe = 'x64\Release\SpatialCanvas.exe'
+          if (-not (Test-Path $exe)) { throw "Missing build output: $exe" }
+          Get-Item $exe | Format-List Name,Length,FullName
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+
+      - name: Upload hardened executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpatialCanvas-corporate-safe-x64
+          path: x64/Release/SpatialCanvas.exe
+          if-no-files-found: error
+          retention-days: 7
