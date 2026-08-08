@@ -179,6 +179,10 @@ namespace
     winrt::com_ptr<IDWriteTextFormat> g_textFmtN;  // M44: not metni (sol-üst hizalı, satır kaydırmalı)
     // M5: ayarlar paneli
     Settings g_set;
+    // Corporate-safe diagnostic counters: counts/HRESULT only, never window titles/content.
+    size_t g_diagEligibleWindows = 0;
+    int g_diagCaptureFailures = 0;
+    HRESULT g_diagFirstCaptureHr = S_OK;
     bool g_panelOpen = false;
     float g_panelA = 0.0f;          // 0 kapalı, 1 açık (animasyonlu)
     constexpr float PANEL_W = 320.0f;
@@ -2949,7 +2953,18 @@ static bool AddTile(HWND hwnd)
         try { t.session.MinUpdateInterval(winrt::TimeSpan{ std::chrono::milliseconds(1000 / std::max(1, g_set.fpsCap)) }); } catch (...) {}
         t.session.StartCapture();
     }
-    catch (...) { return false; }
+    catch (winrt::hresult_error const& e)
+    {
+        ++g_diagCaptureFailures;
+        if (g_diagFirstCaptureHr == S_OK) g_diagFirstCaptureHr = e.code();
+        return false;
+    }
+    catch (...)
+    {
+        ++g_diagCaptureFailures;
+        if (g_diagFirstCaptureHr == S_OK) g_diagFirstCaptureHr = E_FAIL;
+        return false;
+    }
     t.ww = (float)t.lastSize.Width;
     t.wh = (float)t.lastSize.Height;
     // Konum: yapıştırma slotu > kayıtlı layout > mevcut kümenin sağı
@@ -3020,8 +3035,12 @@ static bool AddTile(HWND hwnd)
 
 static void CreateTiles()
 {
+    g_diagEligibleWindows = 0;
+    g_diagCaptureFailures = 0;
+    g_diagFirstCaptureHr = S_OK;
     std::vector<HWND> wins;
     EnumWindows(EnumCb, reinterpret_cast<LPARAM>(&wins));
+    g_diagEligibleWindows = wins.size();
     for (HWND w : wins)
     {
         if ((int)g_tiles.size() >= g_set.maxTiles) break;
@@ -5633,8 +5652,21 @@ int RunCanvasApp()
     CreateTiles();
     if (g_tiles.empty())
     {
-        MessageBoxW(nullptr, TL(L"No window found to capture.", L"Yakalanacak pencere bulunamadı."),
-            L"Spatial Canvas", MB_OK | MB_ICONWARNING);
+        bool wgcSupported = false;
+        try { wgcSupported = winrt::GraphicsCaptureSession::IsSupported(); } catch (...) {}
+        wchar_t msg[768]{};
+        swprintf_s(msg,
+            L"No window found to capture.\n\n"
+            L"Corporate-safe diagnostics (no window titles/content logged):\n"
+            L"Eligible top-level windows: %zu\n"
+            L"Windows.Graphics.Capture supported: %s\n"
+            L"Capture failures: %d\n"
+            L"First capture HRESULT: 0x%08lX",
+            g_diagEligibleWindows,
+            wgcSupported ? L"YES" : L"NO",
+            g_diagCaptureFailures,
+            static_cast<unsigned long>(g_diagFirstCaptureHr));
+        MessageBoxW(nullptr, msg, L"Spatial Canvas - Capture diagnostics", MB_OK | MB_ICONWARNING);
         return 1;
     }
     ReconcileConnectors(); // M75: yüklenen bağlayıcıları açık pencerelere bağla
