@@ -19,8 +19,6 @@
 #include <thread>
 #include <unordered_map>
 #include <mutex>
-#include <wininet.h>             // M48: yeni-sürüm bildirimi (HTTP GET)
-#pragma comment(lib, "wininet.lib")
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #pragma comment(lib, "d3dcompiler.lib")
@@ -122,7 +120,7 @@ struct Settings
 {
     int lang = 0;           // M47: 0 English (varsayilan), 1 Turkce
     bool restoreView = true; // M50: açılışta son kamera görünümünü geri yükle
-    bool updateCheck = true; // M48: açılışta yeni-sürüm kontrolü (sadece bildirim)
+    bool updateCheck = false; // Corporate-safe: network update checks are disabled
     // M48: sürüm feed'i (raw VERSION dosyası, içerik "0.47.0"). HTTP/HTTPS (WinINet).
     std::wstring updateUrl = L"https://raw.githubusercontent.com/13auth/spatial-canvas/main/VERSION";
     std::wstring lastRun; // M53: son çalıştırılan sürüm (güncelleme-sonrası bildirim)
@@ -397,18 +395,10 @@ static void SaveSettings();
 static void ApplyFpsCap();
 static void RestoreOriginal(Tile& t);
 static void RemoveTileAt(int i, bool restoreWindow); // M73: tuval silmede yetim tile'ı kaldır
-static bool QueryAutostart();
-static void ApplyAutostart();
-static void InitD2D();
-static void ReRegisterPullHotkey();
-static void UpdateMatches();
-static void RaiseCanvasTopmost();
-static void LowerCanvas();
-
-// M10: girdi yardımcıları (klavye + fare birleşik)
-static bool IsMouseVk(int vk)
+static bool QueryAutostart()
 {
-    return vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+    // Corporate-safe build: do not inspect login persistence settings.
+    return false;
 }
 
 static int CurMods()
@@ -450,7 +440,7 @@ static void SavePendingRestore()
     {
         if (!t.everParked || !IsWindow(t.source)) continue;
         wchar_t title[256]{};
-        GetWindowTextW(t.source, title, 256);
+        // Corporate-safe: do not persist window titles (may contain confidential data).
         // M18: hwnd|exe|max|x|y|title (title SONDA - '|' içerebilir).
         // hwnd kendi çökmemizden sağ çıkar; exe handle geri dönüşüm kontrolü.
         f << (ULONG_PTR)t.source << L"|" << t.exe << L"|" << (t.wasMax ? 1 : 0)
@@ -900,12 +890,12 @@ static void CycleRow(int id)
             : (g_set.maxTiles == 12 ? 16 : 6));
         break;
     case 6: g_set.bgPreset = (g_set.bgPreset + 1) % 4; break; // M29: +Vinyet
-    case 7: g_set.autostart = !g_set.autostart; ApplyAutostart(); break;
+    case 7: g_set.autostart = false; break; // Corporate-safe: autostart disabled
     case 8: g_set.canvasSpan = 1 - g_set.canvasSpan; ApplyCanvasSpan(); break; // M8: canlı
     case 9: g_set.grid = !g_set.grid; break; // M12
     case 10: g_set.minimap = !g_set.minimap; break; // M36
     case 11: g_set.lang = 1 - g_set.lang; break; // M47: EN/TR
-    case 12: g_set.updateCheck = !g_set.updateCheck; break; // M48
+    case 12: g_set.updateCheck = false; break; // Corporate-safe: network disabled
     case 13: g_set.restoreView = !g_set.restoreView; break; // M50
     case 104: g_set.wheelMod = (g_set.wheelMod + 1) % 5; break;
     case -10: g_panelTab = 0; g_captureRow = -1; return; // M10: sekmeler
@@ -2737,7 +2727,7 @@ static void LoadSettings()
         else if (k == L"dive") g_set.diveZoom = (float)_wtof(v.c_str());
         else if (k == L"max") g_set.maxTiles = _wtoi(v.c_str());
         else if (k == L"lang") g_set.lang = _wtoi(v.c_str()); // M47
-        else if (k == L"updchk") g_set.updateCheck = _wtoi(v.c_str()) != 0; // M48
+        else if (k == L"updchk") g_set.updateCheck = false; // Corporate-safe: ignore persisted enablement
         else if (k == L"updurl") g_set.updateUrl = v; // M48 (test/override)
         else if (k == L"lastrun") g_set.lastRun = v; // M53
         else if (k == L"restview") g_set.restoreView = _wtoi(v.c_str()) != 0; // M50
@@ -2851,36 +2841,9 @@ static void ApplyFpsCap()
     }
 }
 
-// ---- M6: Windows ile başlat (HKCU Run anahtarı - kaynak doğruluk registry) ----
-static bool QueryAutostart()
-{
-    HKEY k{};
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0,
-        KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
-    bool exists = RegQueryValueExW(k, L"SpatialCanvas",
-        nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
-    RegCloseKey(k);
-    return exists;
-}
 
-static void ApplyAutostart()
-{
-    HKEY k{};
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0,
-        KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
-    if (g_set.autostart)
-    {
-        wchar_t path[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, path, MAX_PATH);
-        std::wstring v = L"\"" + std::wstring(path) + L"\"";
-        RegSetValueExW(k, L"SpatialCanvas", 0, REG_SZ,
-            (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
-    }
-    else RegDeleteValueW(k, L"SpatialCanvas");
-    RegCloseKey(k);
-}
+
+
 
 // M8: global geri-çekil kısayolunu (yeniden) kaydet
 static void ReRegisterPullHotkey()
@@ -4555,69 +4518,13 @@ static bool VersionNewer(const std::wstring& feed, const std::wstring& local)
 // Sadece BİLDİRİM - indirme/kurulum YOK. Feed = raw "0.47.0" metni.
 static void UpdateCheckThread(std::wstring url)
 {
-    if (url.empty()) return;
-    std::string body;
-    HINTERNET hNet = InternetOpenW(L"SpatialCanvas-UpdateCheck",
-        INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-    if (hNet)
-    {
-        HINTERNET hUrl = InternetOpenUrlW(hNet, url.c_str(), nullptr, 0,
-            INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
-        if (hUrl)
-        {
-            char buf[128]; DWORD rd = 0;
-            while (body.size() < 64 && InternetReadFile(hUrl, buf, sizeof(buf), &rd) && rd > 0)
-                body.append(buf, rd);
-            InternetCloseHandle(hUrl);
-        }
-        InternetCloseHandle(hNet);
-    }
-    // ilk satır, sadece sürüm karakterleri (rakam/nokta) - HTML hata sayfası vs. elenir
-    std::wstring ver;
-    for (char c : body)
-    {
-        if (c == '\r' || c == '\n') break;
-        if ((c >= '0' && c <= '9') || c == '.') ver += (wchar_t)c;
-        else if (c == ' ' && ver.empty()) continue; // baştaki boşluk
-        else break; // beklenmeyen karakter → feed bozuk, dur
-    }
-    if (ver.empty() || !VersionNewer(ver, APP_VERSION)) return;
-    { std::lock_guard<std::mutex> lk(g_updateMutex); g_updateVer = ver; }
-    if (g_hwnd) PostMessageW(g_hwnd, MSG_UPDATE, 0, 0);
+    (void)url;
+    // Corporate-safe build: outbound network activity intentionally disabled.
 }
 
 static void IpcServerThread()
 {
-    for (;;)
-    {
-        HANDLE pipe = CreateNamedPipeW(L"\\\\.\\pipe\\SpatialCanvas",
-            PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            1, 0, 4096, 0, nullptr);
-        if (pipe == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
-        BOOL ok = ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
-        if (ok)
-        {
-            char buf[1024]; DWORD rd = 0;
-            if (ReadFile(pipe, buf, sizeof(buf) - 1, &rd, nullptr) && rd > 0)
-            {
-                buf[rd] = 0;
-                int wl = MultiByteToWideChar(CP_UTF8, 0, buf, -1, nullptr, 0);
-                if (wl > 1)
-                {
-                    std::wstring w(wl - 1, 0);
-                    MultiByteToWideChar(CP_UTF8, 0, buf, -1, &w[0], wl);
-                    {
-                        std::lock_guard<std::mutex> lk(g_ipcMutex);
-                        g_ipcQueue.push_back(std::move(w));
-                    }
-                    if (g_hwnd) PostMessageW(g_hwnd, MSG_IPC, 0, 0);
-                }
-            }
-        }
-        DisconnectNamedPipe(pipe);
-        CloseHandle(pipe);
-    }
+    // Corporate-safe baseline: no local named-pipe server.
 }
 
 static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -5722,11 +5629,7 @@ int RunCanvasApp()
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     ChangeWindowMessageFilterEx(g_hwnd, g_msgTaskbarCreated, MSGFLT_ALLOW, nullptr);
 
-    // M30: IPC named pipe sunucusu (g_hwnd hazır - PostMessage güvenli)
-    std::thread(IpcServerThread).detach();
-    // M48: yeni-sürüm bildirimi (opt-in; ağ yoksa sessiz, sadece bildirim)
-    if (g_set.updateCheck)
-        std::thread(UpdateCheckThread, g_set.updateUrl).detach();
+    // Corporate-safe baseline: IPC server and network update thread are intentionally disabled.
     // M53: bu sürüm son çalıştırılandan farklıysa = güncellendi → bir kez bildir
     if (!g_set.lastRun.empty() && g_set.lastRun != APP_VERSION)
         ShowToast(TL(L"Updated to v", L"Güncellendi: v") + std::wstring(APP_VERSION) +

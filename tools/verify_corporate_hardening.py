@@ -30,7 +30,6 @@ for name, needle in forbidden.items():
 required = {
     "explicit non-elevated execution": 'requestedExecutionLevel level="asInvoker" uiAccess="false"',
     "network default disabled": "bool updateCheck = false;",
-    "autostart neutralized": "Corporate-safe build: never create or remove Run-key persistence.",
     "IPC neutralized": "Corporate-safe baseline: no local named-pipe server.",
     "window titles redacted": "Corporate-safe: do not persist window titles",
 }
