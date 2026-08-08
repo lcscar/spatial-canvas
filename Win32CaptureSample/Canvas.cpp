@@ -395,10 +395,16 @@ static void SaveSettings();
 static void ApplyFpsCap();
 static void RestoreOriginal(Tile& t);
 static void RemoveTileAt(int i, bool restoreWindow); // M73: tuval silmede yetim tile'ı kaldır
-static bool QueryAutostart()
+static void InitD2D();
+static void ReRegisterPullHotkey();
+static void UpdateMatches();
+static void RaiseCanvasTopmost();
+static void LowerCanvas();
+
+// M10: girdi yardımcıları (klavye + fare birleşik)
+static bool IsMouseVk(int vk)
 {
-    // Corporate-safe build: do not inspect login persistence settings.
-    return false;
+    return vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
 }
 
 static int CurMods()

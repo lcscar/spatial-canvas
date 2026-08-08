@@ -27,6 +27,20 @@ for name, needle in forbidden.items():
     if needle in source:
         errors.append(f"FORBIDDEN: {name}: {needle}")
 
+# Core behavior that must survive the hardening patch.
+core_required = {
+    "mouse-key helper preserved": "static bool IsMouseVk(int vk)",
+    "InitD2D declaration preserved": "static void InitD2D();",
+    "pull-hotkey declaration preserved": "static void ReRegisterPullHotkey();",
+    "search declaration preserved": "static void UpdateMatches();",
+    "raise-canvas declaration preserved": "static void RaiseCanvasTopmost();",
+    "lower-canvas declaration preserved": "static void LowerCanvas();",
+}
+
+for name, required_text in core_required.items():
+    if required_text not in source:
+        errors.append(f"MISSING CORE: {name}: {required_text}")
+
 required = {
     "explicit non-elevated execution": 'requestedExecutionLevel level="asInvoker" uiAccess="false"',
     "network default disabled": "bool updateCheck = false;",
