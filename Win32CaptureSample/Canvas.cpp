@@ -18,6 +18,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #include <exception>
+#include <condition_variable>
 #include <deque>
 #include <thread>
 #include <unordered_map>
@@ -79,6 +80,26 @@ struct Camera
 // aynı pencere her tuvalde ayrı konum/pin durumunda durabilir).
 struct Place { float wx = 0, wy = 0; bool pinned = false; float px = 0, py = 0, pw = 0, ph = 0; };
 
+enum class TileCaptureState
+{
+    Waiting,
+    Live,
+    NoFrame,
+    CaptureError,
+};
+
+struct FrameDeliveryState
+{
+    std::mutex mutex;
+    winrt::Direct3D11CaptureFrame latestFrame{ nullptr };
+    std::atomic_size_t frameArrivedEventCount{ 0 };
+    std::atomic_size_t callbackFrameCount{ 0 };
+    std::atomic<ULONGLONG> firstFrameCallbackTick{ 0 };
+    std::atomic<HRESULT> firstFrameHresult{ S_FALSE };
+    HWND hwnd{};
+    size_t attemptNumber = 0;
+};
+
 struct Tile
 {
     HWND source{};
@@ -114,6 +135,9 @@ struct Tile
     ULONGLONG firstFrameTick = 0;
     size_t frameCount = 0;
     bool noFrameWarningLogged = false;
+    std::shared_ptr<FrameDeliveryState> frameDelivery;
+    TileCaptureState captureState = TileCaptureState::Waiting;
+    HRESULT captureError = S_OK;
     // M73 Slice 2: pencerenin bulunduğu tuvallar + her tuvaldeki yerleşimi. Anahtar
     // seti = üyelik (paylaşımlı). t.wx/wy/pin/px.. = AKTİF tuvalin hydrate kopyası.
     std::unordered_map<int, Place> places;
@@ -217,6 +241,15 @@ namespace
     bool g_initialDiscoveryCompleted = false;
     bool g_startupIssueReported = false;
     bool g_hungAttemptsLogged = false;
+    bool g_d3dMultithreadProtectedBefore = false;
+    bool g_d3dMultithreadProtectedAfter = false;
+    HRESULT g_lastDeviceRemovedReason = S_OK;
+    bool g_probeSummaryShown = false;
+    bool g_probesCompleted = false;
+    ULONGLONG g_probesCompletedTick = 0;
+    constexpr size_t CAPTURE_EXECUTOR_WORKERS = 2;
+    std::atomic_size_t g_activeCaptureInitializations{ 0 };
+    std::atomic_size_t g_peakCaptureInitializations{ 0 };
     bool g_panelOpen = false;
     float g_panelA = 0.0f;          // 0 kapalı, 1 açık (animasyonlu)
     constexpr float PANEL_W = 320.0f;
@@ -385,6 +418,7 @@ namespace
     constexpr UINT MSG_DISCOVERY_COMPLETE = WM_APP + 5;
     constexpr UINT MSG_CAPTURE_COMPLETE = WM_APP + 6;
     constexpr UINT MSG_CAPTURE_FRAME = WM_APP + 7;
+    constexpr UINT MSG_PROBE_COMPLETE = WM_APP + 8;
     std::wstring g_updateVer;                  // M48: feed'deki yeni sürüm (boş=yok)
     std::mutex g_updateMutex;
     bool g_updateAvail = false;                // M48: kalıcı HUD ipucu için
@@ -572,6 +606,16 @@ static winrt::GraphicsCaptureItem CreateItemForWindow(HWND hwnd)
     return item;
 }
 
+static winrt::GraphicsCaptureItem CreateItemForMonitor(HMONITOR monitor)
+{
+    auto factory = winrt::get_activation_factory<winrt::GraphicsCaptureItem>();
+    auto interop = factory.as<IGraphicsCaptureItemInterop>();
+    winrt::GraphicsCaptureItem item{ nullptr };
+    winrt::check_hresult(interop->CreateForMonitor(
+        monitor, winrt::guid_of<winrt::GraphicsCaptureItem>(), winrt::put_abi(item)));
+    return item;
+}
+
 static winrt::com_ptr<ID3D11Texture2D> TextureFromSurface(
     winrt::IDirect3DSurface const& surface)
 {
@@ -615,15 +659,66 @@ struct DiscoveryCompletion
     EnumerationContext enumeration;
 };
 
+struct CaptureProbeResult
+{
+    bool attempted = false;
+    bool createItem = false;
+    bool createFreeThreaded = false;
+    bool createSession = false;
+    bool startCapture = false;
+    size_t frameArrivedEvents = 0;
+    bool firstFrameReceived = false;
+    HRESULT firstFrameHresult = S_FALSE;
+    winrt::SizeInt32 firstFrameSize{};
+};
+
+struct ProbeFrameSignal
+{
+    std::mutex mutex;
+    std::condition_variable changed;
+    size_t events = 0;
+    bool frameReceived = false;
+    HRESULT firstFrameHresult = S_FALSE;
+    winrt::SizeInt32 firstFrameSize{};
+};
+
+struct ProbeCompletion
+{
+    std::vector<HWND> windows;
+    CaptureProbeResult monitor;
+    CaptureProbeResult controlWindow;
+    HWND controlWindowHwnd{};
+};
+
+struct CaptureInitializationScope
+{
+    CaptureInitializationScope()
+    {
+        const size_t active = g_activeCaptureInitializations.fetch_add(1) + 1;
+        size_t peak = g_peakCaptureInitializations.load();
+        while (active > peak &&
+            !g_peakCaptureInitializations.compare_exchange_weak(peak, active)) {}
+    }
+    ~CaptureInitializationScope()
+    {
+        g_activeCaptureInitializations.fetch_sub(1);
+    }
+};
+
 struct CaptureCoordinator
 {
     std::mutex mutex;
     std::deque<CaptureCompletion> captures;
     std::deque<DiscoveryCompletion> discoveries;
+    std::deque<ProbeCompletion> probes;
     std::atomic<bool> closing{ false };
 };
 
 static std::shared_ptr<CaptureCoordinator> g_captureCoordinator;
+static std::unique_ptr<spatial::discovery::BoundedAttemptExecutor> g_captureExecutor;
+static CaptureProbeResult g_monitorProbe;
+static CaptureProbeResult g_controlWindowProbe;
+static HWND g_controlWindowProbeHwnd{};
 
 static std::wstring ProcessNameOf(DWORD pid, DWORD& error)
 {
@@ -808,6 +903,34 @@ static void InitD3D()
         nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
         g_device.put(), nullptr, g_ctx.put()));
     g_winrtDevice = CreateWinrtDevice(g_device);
+
+    // Only the UI thread touches the application's immediate context. WGC owns its
+    // internal device work, and FrameArrived callbacks only transfer WinRT frame
+    // objects through a mutex. ID3D11Multithread protection is therefore audited
+    // and logged, but deliberately not enabled: there is no cross-thread immediate-
+    // context access to protect, and enabling it would add global serialization.
+    winrt::com_ptr<ID3D11Multithread> multithread;
+    HRESULT multithreadHr = g_ctx->QueryInterface(
+        winrt::guid_of<ID3D11Multithread>(), multithread.put_void());
+    if (SUCCEEDED(multithreadHr) && multithread)
+    {
+        g_d3dMultithreadProtectedBefore =
+            multithread->GetMultithreadProtected() != FALSE;
+        g_d3dMultithreadProtectedAfter =
+            multithread->GetMultithreadProtected() != FALSE;
+    }
+    else
+    {
+        g_d3dMultithreadProtectedBefore = false;
+        g_d3dMultithreadProtectedAfter = false;
+    }
+    g_lastDeviceRemovedReason = g_device->GetDeviceRemovedReason();
+    spatial::diagnostics::Log(L"render.multithread",
+        L"ID3D11Multithread.QueryInterface=" + spatial::diagnostics::HexHRESULT(multithreadHr) +
+        L" protected_before=" + (g_d3dMultithreadProtectedBefore ? L"true" : L"false") +
+        L" protected_after=" + (g_d3dMultithreadProtectedAfter ? L"true" : L"false") +
+        L" action=unchanged reason=immediate_context_ui_thread_only device_removed_reason=" +
+        spatial::diagnostics::HexHRESULT(g_lastDeviceRemovedReason));
 
     // Swapchain (flip model)
     auto dxgiDevice = g_device.as<IDXGIDevice>();
@@ -1866,6 +1989,27 @@ static void DrawOverlay()
         float sw = t.ww * g_cam.zoom, sh = t.wh * g_cam.zoom;
         if (sx > (float)g_sw || sy > (float)g_sh || sx + sw < 0 || sy + sh < 0)
             continue;
+        if (!t.srv)
+        {
+            const wchar_t* state = L"WAITING";
+            ID2D1SolidColorBrush* outline = g_brSel.get();
+            if (t.captureState == TileCaptureState::NoFrame)
+            {
+                state = L"NO FRAME";
+                outline = g_brHover.get();
+            }
+            else if (t.captureState == TileCaptureState::CaptureError)
+            {
+                state = L"CAPTURE ERROR";
+                outline = g_brPick.get();
+            }
+            g_d2dRT->FillRectangle(D2D1::RectF(sx, sy, sx + sw, sy + sh), g_brBg.get());
+            if (outline)
+                g_d2dRT->DrawRectangle(D2D1::RectF(sx, sy, sx + sw, sy + sh), outline, 2.0f);
+            D2D1_RECT_F stateRect = D2D1::RectF(sx + 12, sy + 12, sx + sw - 12, sy + sh - 12);
+            g_d2dRT->DrawText(state, static_cast<UINT32>(wcslen(state)),
+                g_textFmt.get(), stateRect, g_brText.get());
+        }
         if (searching) // M9: eşleşmeyenleri karart, eşleşenleri çerçevele
         {
             bool isMatch = std::find(g_matches.begin(), g_matches.end(), i)
@@ -3120,6 +3264,350 @@ static bool ExecuteBoundAction(int vk, int mods)
     return false;
 }
 
+static CaptureProbeResult RunCaptureProbe(
+    std::wstring_view probeName,
+    winrt::IDirect3DDevice const& captureDevice,
+    const std::function<winrt::GraphicsCaptureItem()>& createItem,
+    std::wstring_view createItemStage)
+{
+    CaptureInitializationScope initializationScope;
+    CaptureProbeResult result;
+    result.attempted = true;
+    std::wstring stage(createItemStage);
+    winrt::GraphicsCaptureItem item{ nullptr };
+    winrt::Direct3D11CaptureFramePool pool{ nullptr };
+    winrt::GraphicsCaptureSession session{ nullptr };
+    winrt::event_token token{};
+    bool registered = false;
+    auto signal = std::make_shared<ProbeFrameSignal>();
+
+    try
+    {
+        spatial::diagnostics::Log(L"capture.probe",
+            std::wstring(probeName) + L"_" + stage + L" action=begin");
+        item = createItem();
+        result.createItem = true;
+        spatial::diagnostics::Log(L"capture.probe",
+            std::wstring(probeName) + L"_" + stage + L" result=success item_size=" +
+            std::to_wstring(item.Size().Width) + L"x" + std::to_wstring(item.Size().Height));
+
+        stage = L"CreateFreeThreaded";
+        pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
+            captureDevice, winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2, item.Size());
+        result.createFreeThreaded = true;
+        spatial::diagnostics::Log(L"capture.probe",
+            std::wstring(probeName) + L"_CreateFreeThreaded result=success");
+
+        token = pool.FrameArrived(
+            [signal, probe = std::wstring(probeName)](
+                winrt::Direct3D11CaptureFramePool const& sender, auto const&)
+            {
+                std::lock_guard lock(signal->mutex);
+                ++signal->events;
+                try
+                {
+                    auto frame = sender.TryGetNextFrame();
+                    if (frame)
+                    {
+                        auto size = frame.ContentSize();
+                        if (!signal->frameReceived)
+                        {
+                            signal->frameReceived = true;
+                            signal->firstFrameHresult = S_OK;
+                            signal->firstFrameSize = size;
+                            spatial::diagnostics::Log(L"capture.probe_frame",
+                                probe + L"_first_frame_received=true content_size=" +
+                                std::to_wstring(size.Width) + L"x" +
+                                std::to_wstring(size.Height) + L" HRESULT=0x00000000");
+                        }
+                        frame.Close();
+                    }
+                    else if (!signal->frameReceived)
+                    {
+                        signal->firstFrameHresult = S_FALSE;
+                    }
+                }
+                catch (winrt::hresult_error const& error)
+                {
+                    if (!signal->frameReceived) signal->firstFrameHresult = error.code();
+                    spatial::diagnostics::Log(L"capture.probe_frame",
+                        probe + L"_callback_failure HRESULT=" +
+                        spatial::diagnostics::HexHRESULT(error.code()));
+                }
+                catch (...)
+                {
+                    if (!signal->frameReceived) signal->firstFrameHresult = E_FAIL;
+                    spatial::diagnostics::Log(L"capture.probe_frame",
+                        probe + L"_callback_failure HRESULT=0x80004005");
+                }
+                signal->changed.notify_all();
+            });
+        registered = true;
+
+        stage = L"CreateCaptureSession";
+        session = pool.CreateCaptureSession(item);
+        result.createSession = true;
+        spatial::diagnostics::Log(L"capture.probe",
+            std::wstring(probeName) + L"_CreateCaptureSession result=success");
+
+        stage = L"StartCapture";
+        session.StartCapture();
+        result.startCapture = true;
+        spatial::diagnostics::Log(L"capture.probe",
+            std::wstring(probeName) + L"_StartCapture result=success optional_properties=none");
+
+        {
+            std::unique_lock lock(signal->mutex);
+            signal->changed.wait_for(lock, std::chrono::seconds(5), [&]
+            {
+                return signal->frameReceived;
+            });
+            result.frameArrivedEvents = signal->events;
+            result.firstFrameReceived = signal->frameReceived;
+            result.firstFrameHresult = signal->frameReceived ? S_OK :
+                (signal->events == 0 ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) :
+                    signal->firstFrameHresult);
+            result.firstFrameSize = signal->firstFrameSize;
+        }
+    }
+    catch (winrt::hresult_error const& error)
+    {
+        result.firstFrameHresult = error.code();
+        spatial::diagnostics::Log(L"capture.probe_failure",
+            std::wstring(probeName) + L"_" + stage + L" HRESULT=" +
+            spatial::diagnostics::HexHRESULT(error.code()));
+    }
+    catch (...)
+    {
+        result.firstFrameHresult = E_FAIL;
+        spatial::diagnostics::Log(L"capture.probe_failure",
+            std::wstring(probeName) + L"_" + stage + L" HRESULT=0x80004005");
+    }
+
+    try { if (pool && registered) pool.FrameArrived(token); } catch (...) {}
+    try { if (session) session.Close(); } catch (...) {}
+    try { if (pool) pool.Close(); } catch (...) {}
+    spatial::diagnostics::Log(L"capture.probe_summary",
+        std::wstring(probeName) +
+        L"_StartCapture=" + (result.startCapture ? L"success" : L"failure") +
+        L" " + std::wstring(probeName) + L"_FrameArrived_count=" +
+        std::to_wstring(result.frameArrivedEvents) +
+        L" " + std::wstring(probeName) + L"_first_frame_received=" +
+        (result.firstFrameReceived ? L"true" : L"false") +
+        L" " + std::wstring(probeName) + L"_first_frame_hresult=" +
+        spatial::diagnostics::HexHRESULT(result.firstFrameHresult));
+    return result;
+}
+
+static HWND SelectControlProbeWindow(const std::vector<HWND>& windows)
+{
+    HWND best{};
+    int bestScore = -1;
+    for (HWND hwnd : windows)
+    {
+        if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) continue;
+        int score = 0;
+        if (!IsIconic(hwnd)) score += 4;
+        if (GetWindowTextLengthW(hwnd) > 0) score += 3;
+        if (!GetWindow(hwnd, GW_OWNER)) score += 2;
+        if (!(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) score += 2;
+        RECT rect{};
+        if (GetWindowRect(hwnd, &rect) && rect.right - rect.left >= 300 &&
+            rect.bottom - rect.top >= 200) score += 4;
+        DWORD cloaked = 0;
+        if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED,
+            &cloaked, sizeof(cloaked))) && !cloaked) score += 2;
+        if (score > bestScore)
+        {
+            bestScore = score;
+            best = hwnd;
+        }
+    }
+    spatial::diagnostics::Log(L"capture.control_window_selection",
+        L"hwnd=" + spatial::diagnostics::HexHandle(best) +
+        L" priority_score=" + std::to_wstring(bestScore) +
+        L" parked=false selection_is_prioritization_only=true");
+    return best;
+}
+
+static void QueueProbeCompletion(
+    const std::shared_ptr<CaptureCoordinator>& coordinator,
+    ProbeCompletion&& completion)
+{
+    if (!coordinator || coordinator->closing.load()) return;
+    {
+        std::lock_guard lock(coordinator->mutex);
+        coordinator->probes.push_back(std::move(completion));
+    }
+    PostMessageW(g_hwnd, MSG_PROBE_COMPLETE, 0, 0);
+}
+
+static HWND StartDiagnosticProbes(const std::vector<HWND>& windows)
+{
+    auto coordinator = g_captureCoordinator;
+    auto captureDevice = g_winrtDevice;
+    const HWND controlWindow = SelectControlProbeWindow(windows);
+    auto completionClaimed = std::make_shared<std::atomic<bool>>(false);
+    try
+    {
+        std::thread([coordinator, captureDevice, controlWindow, completionClaimed]
+        {
+            ProbeCompletion completion;
+            if (controlWindow) completion.windows.push_back(controlWindow);
+            completion.controlWindowHwnd = controlWindow;
+            try
+            {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                POINT origin{};
+                HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+                completion.monitor = RunCaptureProbe(L"monitor", captureDevice,
+                    [primary] { return CreateItemForMonitor(primary); }, L"CreateForMonitor");
+
+                if (completion.controlWindowHwnd)
+                {
+                    HWND hwnd = completion.controlWindowHwnd;
+                    completion.controlWindow = RunCaptureProbe(L"control_window", captureDevice,
+                        [hwnd] { return CreateItemForWindow(hwnd); }, L"CreateForWindow");
+                }
+                else
+                {
+                    completion.controlWindow.firstFrameHresult =
+                        HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+                }
+                winrt::uninit_apartment();
+            }
+            catch (winrt::hresult_error const& error)
+            {
+                completion.monitor.firstFrameHresult = error.code();
+                completion.controlWindow.firstFrameHresult = error.code();
+                spatial::diagnostics::Log(L"capture.probe_failure",
+                    L"stage=probe_thread HRESULT=" +
+                    spatial::diagnostics::HexHRESULT(error.code()));
+            }
+            catch (...)
+            {
+                completion.monitor.firstFrameHresult = E_FAIL;
+                completion.controlWindow.firstFrameHresult = E_FAIL;
+                spatial::diagnostics::Log(L"capture.probe_failure",
+                    L"stage=probe_thread HRESULT=0x80004005");
+            }
+            bool expected = false;
+            if (completionClaimed->compare_exchange_strong(expected, true))
+                QueueProbeCompletion(coordinator, std::move(completion));
+        }).detach();
+        std::thread([coordinator, controlWindow, completionClaimed]
+        {
+            Sleep(12000);
+            bool expected = false;
+            if (!completionClaimed->compare_exchange_strong(expected, true)) return;
+            ProbeCompletion timeout;
+            if (controlWindow) timeout.windows.push_back(controlWindow);
+            timeout.controlWindowHwnd = controlWindow;
+            timeout.monitor.attempted = true;
+            timeout.monitor.firstFrameHresult = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            timeout.controlWindow.attempted = controlWindow != nullptr;
+            timeout.controlWindow.firstFrameHresult = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            spatial::diagnostics::Log(L"capture.probe_watchdog",
+                L"elapsed_ms=12000 result=probe_thread_not_returned action=release_control_window_without_termination");
+            QueueProbeCompletion(coordinator, std::move(timeout));
+        }).detach();
+        spatial::diagnostics::Log(L"capture.probe_dispatch",
+            L"monitor_and_control_window sequential=true ui_thread_blocked=false watchdog_ms=12000");
+    }
+    catch (...)
+    {
+        bool expected = false;
+        if (!completionClaimed->compare_exchange_strong(expected, true))
+            return controlWindow;
+        ProbeCompletion completion;
+        if (controlWindow) completion.windows.push_back(controlWindow);
+        completion.controlWindowHwnd = controlWindow;
+        completion.monitor.firstFrameHresult = E_OUTOFMEMORY;
+        completion.controlWindow.firstFrameHresult = E_OUTOFMEMORY;
+        QueueProbeCompletion(coordinator, std::move(completion));
+    }
+    return controlWindow;
+}
+
+static void RegisterFrameDeliveryHandler(Tile& t, size_t attemptNumber)
+{
+    t.frameDelivery = std::make_shared<FrameDeliveryState>();
+    t.frameDelivery->hwnd = t.source;
+    t.frameDelivery->attemptNumber = attemptNumber;
+    auto delivery = t.frameDelivery;
+    t.frameArrivedToken = t.pool.FrameArrived(
+        [delivery](winrt::Direct3D11CaptureFramePool const& sender, auto const&)
+        {
+            const size_t eventCount = delivery->frameArrivedEventCount.fetch_add(1) + 1;
+            if (eventCount == 1)
+            {
+                spatial::diagnostics::Log(L"capture.frame_arrived",
+                    L"attempt=" + std::to_wstring(delivery->attemptNumber) +
+                    L" hwnd=" + spatial::diagnostics::HexHandle(delivery->hwnd) +
+                    L" frame_arrived_event_count=1 callback_tick=" +
+                    std::to_wstring(GetTickCount64()));
+            }
+
+            try
+            {
+                auto frame = sender.TryGetNextFrame();
+                if (frame)
+                {
+                    auto size = frame.ContentSize();
+                    {
+                        std::lock_guard lock(delivery->mutex);
+                        delivery->latestFrame = frame;
+                    }
+                    const size_t callbackFrames = delivery->callbackFrameCount.fetch_add(1) + 1;
+                    if (callbackFrames == 1)
+                    {
+                        const ULONGLONG tick = GetTickCount64();
+                        delivery->firstFrameCallbackTick = tick;
+                        delivery->firstFrameHresult = S_OK;
+                        spatial::diagnostics::Log(L"capture.callback_first_frame",
+                            L"attempt=" + std::to_wstring(delivery->attemptNumber) +
+                            L" hwnd=" + spatial::diagnostics::HexHandle(delivery->hwnd) +
+                            L" result=frame_received content_size=" +
+                            std::to_wstring(size.Width) + L"x" + std::to_wstring(size.Height) +
+                            L" HRESULT=0x00000000 callback_tick=" + std::to_wstring(tick));
+                    }
+                }
+                else if (eventCount == 1)
+                {
+                    delivery->firstFrameHresult = S_FALSE;
+                    spatial::diagnostics::Log(L"capture.callback_first_frame",
+                        L"attempt=" + std::to_wstring(delivery->attemptNumber) +
+                        L" hwnd=" + spatial::diagnostics::HexHandle(delivery->hwnd) +
+                        L" result=no_frame HRESULT=0x00000001");
+                }
+            }
+            catch (winrt::hresult_error const& error)
+            {
+                if (delivery->callbackFrameCount.load() == 0)
+                    delivery->firstFrameHresult = error.code();
+                spatial::diagnostics::Log(L"capture.callback_frame_failure",
+                    L"attempt=" + std::to_wstring(delivery->attemptNumber) +
+                    L" hwnd=" + spatial::diagnostics::HexHandle(delivery->hwnd) +
+                    L" HRESULT=" + spatial::diagnostics::HexHRESULT(error.code()));
+            }
+            catch (...)
+            {
+                if (delivery->callbackFrameCount.load() == 0)
+                    delivery->firstFrameHresult = E_FAIL;
+                spatial::diagnostics::Log(L"capture.callback_frame_failure",
+                    L"attempt=" + std::to_wstring(delivery->attemptNumber) +
+                    L" hwnd=" + spatial::diagnostics::HexHandle(delivery->hwnd) +
+                    L" HRESULT=0x80004005");
+            }
+
+            bool expected = false;
+            if (g_frameWakePending.compare_exchange_strong(expected, true))
+                PostMessageW(g_hwnd, MSG_CAPTURE_FRAME, 0, 0);
+        });
+    t.frameArrivedRegistered = true;
+}
+
 static void CloseCaptureResources(Tile& t)
 {
     try
@@ -3134,6 +3622,11 @@ static void CloseCaptureResources(Tile& t)
     t.session = nullptr;
     t.pool = nullptr;
     t.item = nullptr;
+    if (t.frameDelivery)
+    {
+        std::lock_guard lock(t.frameDelivery->mutex);
+        t.frameDelivery->latestFrame = nullptr;
+    }
 }
 
 static void QueueCaptureCompletion(
@@ -3156,6 +3649,7 @@ static void CaptureWindowOnWorker(HWND hwnd,
     winrt::IDirect3DDevice captureDevice,
     const std::shared_ptr<CaptureCoordinator>& coordinator)
 {
+    CaptureInitializationScope initializationScope;
     const size_t attemptNumber = g_captureAttemptSequence.fetch_add(1) + 1;
     const std::wstring hwndText = spatial::diagnostics::HexHandle(hwnd);
     CaptureCompletion completion;
@@ -3166,7 +3660,7 @@ static void CaptureWindowOnWorker(HWND hwnd,
 
     spatial::diagnostics::Log(L"capture.attempt",
         L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-        L" worker=independent stage=inspect");
+        L" worker=bounded_long_lived stage=inspect");
 
     if (!IsWindow(hwnd))
     {
@@ -3204,11 +3698,9 @@ static void CaptureWindowOnWorker(HWND hwnd,
     if (!t.icon) t.icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICON));
     if (!t.icon) t.icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICONSM));
 
-    std::wstring captureStage = L"worker.winrt.init_apartment";
+    std::wstring captureStage = L"GraphicsCaptureItem.CreateForWindow";
     try
     {
-        winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        captureStage = L"GraphicsCaptureItem.CreateForWindow";
         spatial::diagnostics::Log(L"capture.stage",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" stage=" + captureStage);
@@ -3236,13 +3728,7 @@ static void CaptureWindowOnWorker(HWND hwnd,
         spatial::diagnostics::Log(L"capture.stage",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" stage=CaptureFramePool.FrameArrived action=register");
-        t.frameArrivedToken = t.pool.FrameArrived([](auto const&, auto const&)
-        {
-            bool expected = false;
-            if (g_frameWakePending.compare_exchange_strong(expected, true))
-                PostMessageW(g_hwnd, MSG_CAPTURE_FRAME, 0, 0);
-        });
-        t.frameArrivedRegistered = true;
+        RegisterFrameDeliveryHandler(t, attemptNumber);
         spatial::diagnostics::Log(L"capture.stage",
             L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
             L" stage=CaptureFramePool.FrameArrived result=registered");
@@ -3292,10 +3778,26 @@ static void CaptureWindowOnWorker(HWND hwnd,
     QueueCaptureCompletion(coordinator, std::move(completion));
 }
 
-static void FinalizeCapturedTile(Tile&& captured, size_t attemptNumber)
+static void FinalizeCapturedTile(Tile&& captured, size_t attemptNumber, bool parkSource = true)
 {
     Tile t = std::move(captured);
     const std::wstring hwndText = spatial::diagnostics::HexHandle(t.source);
+    if (t.exe.empty()) t.exe = ExeNameOf(t.source);
+    if (t.exePath.empty()) t.exePath = ExePathOf(t.source);
+    if (t.lastSize.Width <= 0 || t.lastSize.Height <= 0)
+    {
+        RECT bounds{};
+        if (GetWindowRect(t.source, &bounds))
+        {
+            t.lastSize.Width = std::max(160L, bounds.right - bounds.left);
+            t.lastSize.Height = std::max(90L, bounds.bottom - bounds.top);
+        }
+        else
+        {
+            t.lastSize.Width = 480;
+            t.lastSize.Height = 270;
+        }
+    }
     t.ww = (float)t.lastSize.Width;
     t.wh = (float)t.lastSize.Height;
     // Konum: yapıştırma slotu > kayıtlı layout > mevcut kümenin sağı
@@ -3358,12 +3860,23 @@ static void FinalizeCapturedTile(Tile&& captured, size_t attemptNumber)
             t.px = p.px; t.py = p.py; t.pw = p.pw; t.ph = p.ph;
         }
     }
+    if (!parkSource) t.pinnedFlag = false;
     g_tiles.push_back(std::move(t));
-    ParkWindow(g_tiles.back(), (int)g_tiles.size() - 1);
-    spatial::diagnostics::Log(L"lifecycle.park",
-        L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
-        L" result=success tile_index=" +
-        std::to_wstring(g_tiles.size() - 1));
+    if (parkSource)
+    {
+        ParkWindow(g_tiles.back(), (int)g_tiles.size() - 1);
+        spatial::diagnostics::Log(L"lifecycle.park",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" result=success tile_index=" +
+            std::to_wstring(g_tiles.size() - 1));
+    }
+    else
+    {
+        spatial::diagnostics::Log(L"capture.placeholder",
+            L"attempt=" + std::to_wstring(attemptNumber) + L" hwnd=" + hwndText +
+            L" state=CAPTURE_ERROR source_parked=false tile_index=" +
+            std::to_wstring(g_tiles.size() - 1));
+    }
     SaveLayout();
 }
 
@@ -3433,6 +3946,20 @@ static void RecordCaptureCompletion(CaptureCompletion&& completion)
         ++g_diag.captureFailures;
         if (g_diag.firstCaptureHr == S_OK)
             g_diag.firstCaptureHr = FAILED(completion.result.error) ? completion.result.error : E_FAIL;
+        if (IsWindow(completion.hwnd))
+        {
+            bool duplicate = false;
+            for (const auto& tile : g_tiles)
+                if (tile.source == completion.hwnd) { duplicate = true; break; }
+            if (!duplicate)
+            {
+                completion.tile.captureState = TileCaptureState::CaptureError;
+                completion.tile.captureError = FAILED(completion.result.error) ?
+                    completion.result.error : E_FAIL;
+                FinalizeCapturedTile(std::move(completion.tile),
+                    completion.attemptNumber, false);
+            }
+        }
         break;
     }
 }
@@ -3478,31 +4005,17 @@ static void StartCaptureAttempts(const std::vector<HWND>& windows)
     if (pending.empty()) return;
 
     g_diag.attempts += pending.size();
-    auto coordinator = g_captureCoordinator;
-    auto captureDevice = g_winrtDevice;
-    auto dispatch = spatial::discovery::DispatchWindowAttemptsIndependently(
-        pending,
-        [captureDevice, coordinator](HWND hwnd) {
-            CaptureWindowOnWorker(hwnd, captureDevice, coordinator);
-        },
-        [coordinator](HWND hwnd, HRESULT error) {
-            const size_t attemptNumber = g_captureAttemptSequence.fetch_add(1) + 1;
-            spatial::diagnostics::Log(L"capture.failure",
-                L"attempt=" + std::to_wstring(attemptNumber) +
-                L" hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
-                L" stage=worker_dispatch HRESULT=" +
-                spatial::diagnostics::HexHRESULT(error) +
-                L" action=skip_and_continue");
-            CaptureCompletion failed;
-            failed.hwnd = hwnd;
-            failed.attemptNumber = attemptNumber;
-            failed.result = { spatial::discovery::AttemptStatus::Failed, error };
-            QueueCaptureCompletion(coordinator, std::move(failed));
-        });
+    auto dispatch = g_captureExecutor ? g_captureExecutor->Submit(pending) :
+        spatial::discovery::DispatchSummary{ pending.size(), 0, pending.size() };
     spatial::diagnostics::Log(L"capture.dispatch",
         L"candidates=" + std::to_wstring(dispatch.discovered) +
-        L" independent_workers=" + std::to_wstring(dispatch.dispatched) +
+        L" queued=" + std::to_wstring(dispatch.dispatched) +
         L" dispatch_failures=" + std::to_wstring(dispatch.dispatchFailures) +
+        L" capture_executor_model=bounded_long_lived_mta" +
+        L" worker_count=" + std::to_wstring(
+            g_captureExecutor ? g_captureExecutor->WorkerCount() : 0) +
+        L" normal_executor_concurrency_limit=" +
+            std::to_wstring(CAPTURE_EXECUTOR_WORKERS) +
         L" capture_limit=none ui_thread_blocked=false");
 }
 
@@ -3553,7 +4066,38 @@ static void DrainDiscoveryCompletions()
             g_diag = completion.enumeration.diagnostics;
             g_initialDiscoveryCompleted = true;
         }
-        StartCaptureAttempts(completion.enumeration.windows);
+        if (completion.initial)
+        {
+            HWND heldForControlProbe = StartDiagnosticProbes(completion.enumeration.windows);
+            if (heldForControlProbe) g_captureScheduled.insert(heldForControlProbe);
+            std::vector<HWND> normalWindows;
+            normalWindows.reserve(completion.enumeration.windows.size());
+            for (HWND hwnd : completion.enumeration.windows)
+                if (hwnd != heldForControlProbe) normalWindows.push_back(hwnd);
+            StartCaptureAttempts(normalWindows);
+        }
+        else StartCaptureAttempts(completion.enumeration.windows);
+    }
+}
+
+static void DrainProbeCompletions()
+{
+    if (!g_captureCoordinator) return;
+    std::deque<ProbeCompletion> completed;
+    {
+        std::lock_guard lock(g_captureCoordinator->mutex);
+        completed.swap(g_captureCoordinator->probes);
+    }
+    for (auto& completion : completed)
+    {
+        g_monitorProbe = completion.monitor;
+        g_controlWindowProbe = completion.controlWindow;
+        g_controlWindowProbeHwnd = completion.controlWindowHwnd;
+        g_probesCompleted = true;
+        g_probesCompletedTick = GetTickCount64();
+        if (completion.controlWindowHwnd)
+            g_captureScheduled.erase(completion.controlWindowHwnd);
+        StartCaptureAttempts(completion.windows);
     }
 }
 
@@ -3976,23 +4520,36 @@ static bool UpdateTiles()
             if (t.title != b) { t.title = b; any = true; } // zoom-out etiketi tazelensin
             t.titleTick = tn;
         }
-        std::wstring frameStage = L"CaptureFramePool.TryGetNextFrame";
+        if (t.captureState == TileCaptureState::CaptureError || !t.frameDelivery)
+            continue;
+        std::wstring frameStage = L"FrameArrived.latestFrame";
         try
         {
-        // NOT: M18'in drain-to-newest + CopySubresourceRegion(içerik-boyut)
-        // değişikliği tile'ları SİYAH bıraktı (capture kopyası boş kaldı).
-        // M15'teki kanıtlı tek-frame + CopyResource(tam) yoluna dönüldü.
-        auto frame = t.pool.TryGetNextFrame();
+        // Canonical WGC delivery: TryGetNextFrame runs inside FrameArrived. The UI
+        // consumes the newest frame object transferred by that callback; it never
+        // races the callback by polling the frame pool from another thread.
+        winrt::Direct3D11CaptureFrame frame{ nullptr };
+        {
+            std::lock_guard lock(t.frameDelivery->mutex);
+            frame = std::move(t.frameDelivery->latestFrame);
+            t.frameDelivery->latestFrame = nullptr;
+        }
         if (!frame)
         {
             if (!t.noFrameWarningLogged && t.captureStartedTick &&
                 GetTickCount64() - t.captureStartedTick > 5000)
             {
                 t.noFrameWarningLogged = true;
+                t.captureState = TileCaptureState::NoFrame;
                 spatial::diagnostics::Log(L"capture.no_frame",
                     L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
                     L" elapsed_ms=" + std::to_wstring(GetTickCount64() - t.captureStartedTick) +
-                    L" stage=CaptureFramePool.TryGetNextFrame result=no_frame_yet");
+                    L" frame_arrived_event_count=" +
+                    std::to_wstring(t.frameDelivery->frameArrivedEventCount.load()) +
+                    L" callback_frame_count=" +
+                    std::to_wstring(t.frameDelivery->callbackFrameCount.load()) +
+                    L" stage=FrameArrived.callback result=no_frame_yet placeholder=NO_FRAME");
+                any = true;
             }
             continue;
         }
@@ -4025,6 +4582,7 @@ static bool UpdateTiles()
         frameStage = L"ID3D11DeviceContext.CopyResource";
         g_ctx->CopyResource(t.tex.get(), frameTex.get());
         ++t.frameCount;
+        t.captureState = TileCaptureState::Live;
         if (t.frameCount == 1)
         {
             t.firstFrameTick = GetTickCount64();
@@ -4032,7 +4590,11 @@ static bool UpdateTiles()
                 L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
                 L" content_size=" + std::to_wstring(size.Width) + L"x" +
                 std::to_wstring(size.Height) + L" latency_ms=" +
-                std::to_wstring(t.firstFrameTick - t.captureStartedTick));
+                std::to_wstring(t.firstFrameTick - t.captureStartedTick) +
+                L" frame_arrived_event_count=" +
+                std::to_wstring(t.frameDelivery->frameArrivedEventCount.load()) +
+                L" callback_first_frame_tick=" +
+                std::to_wstring(t.frameDelivery->firstFrameCallbackTick.load()));
         }
         any = true; // M19: yeni kare geldi - ekran değişti
         if (size.Width != t.lastSize.Width || size.Height != t.lastSize.Height)
@@ -4052,9 +4614,16 @@ static bool UpdateTiles()
             // M18: cihaz kaybını pencere ölümünden AYIR - cihaz kaybında tile
             // öldürmek tüm pencereleri şeritte yetim bırakırdı; reinit devralır
             if (g_device && g_device->GetDeviceRemovedReason() != S_OK)
+            {
+                g_lastDeviceRemovedReason = g_device->GetDeviceRemovedReason();
                 g_deviceLost = true;
+            }
             else
-                t.alive = false; // pencere/oturum gerçekten öldü
+            {
+                t.captureState = TileCaptureState::CaptureError;
+                t.captureError = e.code();
+                CloseCaptureResources(t);
+            }
         }
         catch (...)
         {
@@ -4062,9 +4631,16 @@ static bool UpdateTiles()
                 L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
                 L" stage=" + frameStage + L" HRESULT=0x80004005");
             if (g_device && g_device->GetDeviceRemovedReason() != S_OK)
+            {
+                g_lastDeviceRemovedReason = g_device->GetDeviceRemovedReason();
                 g_deviceLost = true;
+            }
             else
-                t.alive = false;
+            {
+                t.captureState = TileCaptureState::CaptureError;
+                t.captureError = E_FAIL;
+                CloseCaptureResources(t);
+            }
         }
     }
     return any;
@@ -4072,6 +4648,9 @@ static bool UpdateTiles()
 
 static void MaybeReportStartupIssue()
 {
+    // The controlled-probe summary is the single user-facing RCA dialog. Keep
+    // this legacy path only for failures that occur before probes can complete.
+    if (g_probesCompleted) return;
     if (g_startupIssueReported || !g_initialDiscoveryCompleted || !g_tiles.empty()) return;
 
     const size_t completed = g_diag.capturesStarted + g_diag.captureFailures +
@@ -4141,25 +4720,115 @@ static void MaybeLogHungCaptureAttempts()
     }
 }
 
-static void MaybeWarnNoFrames()
+static std::wstring ProbeStartText(const CaptureProbeResult& probe)
 {
-    if (g_noFrameNoticeShown || !g_captureStartupTick ||
-        GetTickCount64() - g_captureStartupTick < 8000 || g_tiles.empty())
-        return;
-    size_t frames = 0;
-    for (const auto& tile : g_tiles) frames += tile.frameCount;
-    if (frames != 0) return;
+    if (!probe.attempted) return L"not_attempted";
+    return probe.startCapture ? L"success" : L"failure";
+}
 
-    g_noFrameNoticeShown = true;
-    spatial::diagnostics::Log(L"render.no_frames",
-        L"capture_sessions_started=" + std::to_wstring(g_tiles.size()) +
-        L" frames_received=0 elapsed_ms=" +
-        std::to_wstring(GetTickCount64() - g_captureStartupTick));
-    MessageBoxW(g_hwnd,
-        L"Capture sessions started, but no frames were received within 8 seconds.\n\n"
-        L"The windows were discovered and StartCapture succeeded; the failure is now in frame delivery.\n"
-        L"See SpatialCanvas-debug.log beside SpatialCanvas.exe for per-window details.",
-        L"Spatial Canvas - No capture frames", MB_OK | MB_ICONWARNING);
+static void MaybeShowDiagnosticSummary()
+{
+    if (g_probeSummaryShown || !g_probesCompleted) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_probesCompletedTick < 8000) return;
+
+    const size_t completed = g_diag.capturesStarted + g_diag.captureFailures +
+        g_diag.userRuleSkipped;
+    const bool allAttemptsReturned = completed >= g_diag.attempts && g_capturePending.empty();
+    if (!allAttemptsReturned && now - g_probesCompletedTick < 20000) return;
+
+    size_t windowEvents = 0;
+    size_t callbackFirstFrames = 0;
+    size_t uiFrames = 0;
+    for (const auto& tile : g_tiles)
+    {
+        if (tile.frameDelivery)
+        {
+            windowEvents += tile.frameDelivery->frameArrivedEventCount.load();
+            if (tile.frameDelivery->callbackFrameCount.load() > 0) ++callbackFirstFrames;
+        }
+        if (tile.frameCount > 0) ++uiFrames;
+    }
+
+    g_lastDeviceRemovedReason = g_device ? g_device->GetDeviceRemovedReason() : E_POINTER;
+    const size_t activeWorkers = g_captureExecutor ? g_captureExecutor->ActiveWorkers() : 0;
+    const size_t peakWorkers = g_captureExecutor ? g_captureExecutor->PeakActiveWorkers() : 0;
+    const size_t peakInitializations = g_peakCaptureInitializations.load();
+
+    std::wstring classification;
+    if (!g_monitorProbe.firstFrameReceived && windowEvents == 0)
+        classification = L"SYSTEMIC: monitor and window pipelines delivered no FrameArrived frame; inspect WGC/device/session/environment.";
+    else if (g_monitorProbe.firstFrameReceived && !g_controlWindowProbe.firstFrameReceived)
+        classification = L"WINDOW-SPECIFIC: monitor control works, but the unparked control window did not deliver a frame.";
+    else if (g_controlWindowProbe.firstFrameReceived && callbackFirstFrames == 0)
+        classification = L"NORMAL-LIFECYCLE: unparked control works, but normal sessions do not; compare parking/session ownership.";
+    else if (callbackFirstFrames > 0 && uiFrames == 0)
+        classification = L"HANDOFF/RENDER: callbacks receive valid frames, but the UI has not consumed/rendered them.";
+    else if (uiFrames > 0)
+        classification = L"LIVE: WGC callback delivery and UI rendering both succeeded.";
+    else if (!allAttemptsReturned)
+        classification = L"INITIALIZATION: at least one bounded worker remains inside a capture API; the other worker and UI remain active.";
+    else
+        classification = L"MIXED: use the counters and HRESULTs below with the adjacent debug log.";
+
+    std::wstring message =
+        L"WINDOW CAPTURE\n"
+        L"sessions_started: " + std::to_wstring(g_diag.capturesStarted) +
+        L"\nframe_arrived_events: " + std::to_wstring(windowEvents) +
+        L"\nfirst_frames_callback: " + std::to_wstring(callbackFirstFrames) +
+        L"\nfirst_frames_rendered: " + std::to_wstring(uiFrames) +
+        L"\nattempts_completed: " + std::to_wstring(completed) + L"/" +
+            std::to_wstring(g_diag.attempts) +
+        L"\n\nMONITOR CONTROL\n"
+        L"CreateForMonitor: " + std::wstring(g_monitorProbe.createItem ? L"success" : L"failure") +
+        L"\nCreateFreeThreaded: " + std::wstring(g_monitorProbe.createFreeThreaded ? L"success" : L"failure") +
+        L"\nCreateCaptureSession: " + std::wstring(g_monitorProbe.createSession ? L"success" : L"failure") +
+        L"\nStartCapture: " + ProbeStartText(g_monitorProbe) +
+        L"\nframe_arrived_events: " + std::to_wstring(g_monitorProbe.frameArrivedEvents) +
+        L"\nfirst_frame: " + std::wstring(g_monitorProbe.firstFrameReceived ? L"yes" : L"no") +
+        L"\nfirst_frame_hresult: " + spatial::diagnostics::HexHRESULT(g_monitorProbe.firstFrameHresult) +
+        L"\n\nCONTROL WINDOW\n"
+        L"CreateForWindow: " + std::wstring(g_controlWindowProbe.createItem ? L"success" : L"failure") +
+        L"\nStartCapture: " + ProbeStartText(g_controlWindowProbe) +
+        L"\nframe_arrived_events: " + std::to_wstring(g_controlWindowProbe.frameArrivedEvents) +
+        L"\nfirst_frame: " + std::wstring(g_controlWindowProbe.firstFrameReceived ? L"yes" : L"no") +
+        L"\nfirst_frame_hresult: " + spatial::diagnostics::HexHRESULT(g_controlWindowProbe.firstFrameHresult) +
+        L"\nparked: false\n\nD3D11\n"
+        L"multithread_protected_before: " +
+            std::wstring(g_d3dMultithreadProtectedBefore ? L"true" : L"false") +
+        L"\nmultithread_protected_after: " +
+            std::wstring(g_d3dMultithreadProtectedAfter ? L"true" : L"false") +
+        L"\ndevice_removed_reason: " +
+            spatial::diagnostics::HexHRESULT(g_lastDeviceRemovedReason) +
+        L"\n\nTHREADING\n"
+        L"capture_executor_model: bounded_long_lived_mta\n"
+        L"configured_workers: " + std::to_wstring(CAPTURE_EXECUTOR_WORKERS) +
+        L"\nactive_capture_workers: " + std::to_wstring(activeWorkers) +
+        L"\nnormal_executor_peak_workers: " + std::to_wstring(peakWorkers) +
+        L"\nmax_concurrent_capture_initializations: " + std::to_wstring(peakInitializations) +
+        L"\n\nRCA CLASS\n" + classification +
+        L"\n\nPlaceholders remain visible. Full details: SpatialCanvas-debug.log";
+
+    spatial::diagnostics::Log(L"capture.rca_summary",
+        L"sessions_started=" + std::to_wstring(g_diag.capturesStarted) +
+        L" window_frame_arrived_events=" + std::to_wstring(windowEvents) +
+        L" window_first_frames_callback=" + std::to_wstring(callbackFirstFrames) +
+        L" window_first_frames_rendered=" + std::to_wstring(uiFrames) +
+        L" monitor_start=" + ProbeStartText(g_monitorProbe) +
+        L" monitor_events=" + std::to_wstring(g_monitorProbe.frameArrivedEvents) +
+        L" monitor_first_frame=" + (g_monitorProbe.firstFrameReceived ? L"true" : L"false") +
+        L" control_start=" + ProbeStartText(g_controlWindowProbe) +
+        L" control_events=" + std::to_wstring(g_controlWindowProbe.frameArrivedEvents) +
+        L" control_first_frame=" + (g_controlWindowProbe.firstFrameReceived ? L"true" : L"false") +
+        L" control_parked=false device_removed_reason=" +
+            spatial::diagnostics::HexHRESULT(g_lastDeviceRemovedReason) +
+        L" active_workers=" + std::to_wstring(activeWorkers) +
+        L" normal_executor_peak_workers=" + std::to_wstring(peakWorkers) +
+        L" peak_initializations=" + std::to_wstring(peakInitializations) +
+        L" classification=" + classification);
+    g_probeSummaryShown = true;
+    MessageBoxW(g_hwnd, message.c_str(), L"Spatial Canvas - Capture RCA summary",
+        MB_OK | (uiFrames > 0 ? MB_ICONINFORMATION : MB_ICONWARNING));
 }
 
 // ---- M3: Yaşam döngüsü ----
@@ -4386,6 +5055,7 @@ static void HandleDeviceLost()
             {
                 Tile& t = g_tiles[i];
                 if (!IsWindow(t.source)) { RemoveTileAt(i, false); continue; }
+                if (t.captureState == TileCaptureState::CaptureError) continue;
                 try
                 {
                     t.item = CreateItemForWindow(t.source);
@@ -4393,22 +5063,28 @@ static void HandleDeviceLost()
                     t.pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
                         g_winrtDevice, winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                         2, t.lastSize);
-                    t.frameArrivedToken = t.pool.FrameArrived([](auto const&, auto const&)
-                    {
-                        bool expected = false;
-                        if (g_frameWakePending.compare_exchange_strong(expected, true))
-                            PostMessageW(g_hwnd, MSG_CAPTURE_FRAME, 0, 0);
-                    });
-                    t.frameArrivedRegistered = true;
+                    RegisterFrameDeliveryHandler(t, 0);
                     t.session = t.pool.CreateCaptureSession(t.item);
                     t.session.StartCapture();
+                    t.captureStartedTick = GetTickCount64();
+                    t.captureState = TileCaptureState::Waiting;
                     t.alive = true;
+                }
+                catch (winrt::hresult_error const& error)
+                {
+                    CloseCaptureResources(t);
+                    t.captureState = TileCaptureState::CaptureError;
+                    t.captureError = error.code();
+                    spatial::diagnostics::Log(L"capture.placeholder",
+                        L"hwnd=" + spatial::diagnostics::HexHandle(t.source) +
+                        L" state=CAPTURE_ERROR stage=device_recovery HRESULT=" +
+                        spatial::diagnostics::HexHRESULT(error.code()));
                 }
                 catch (...)
                 {
-                    // bu pencere artık yakalanamıyor: şeritte bırakma
-                    RestoreOriginal(t);
-                    RemoveTileAt(i, false);
+                    CloseCaptureResources(t);
+                    t.captureState = TileCaptureState::CaptureError;
+                    t.captureError = E_FAIL;
                 }
             }
             ShowToast(TL(L"Graphics device restored", L"Grafik cihazı yenilendi"));
@@ -5815,6 +6491,9 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_frameWakePending = false;
         g_frameWakeRequested = true;
         return 0;
+    case MSG_PROBE_COMPLETE:
+        DrainProbeCompletions();
+        return 0;
     case WM_HOTKEY:
         if (wp == HOTKEY_TOGGLE)
         {
@@ -6273,8 +6952,49 @@ int RunCanvasApp()
     InitD3D();
     InitD2D();
     g_captureCoordinator = std::make_shared<CaptureCoordinator>();
+    {
+        auto coordinator = g_captureCoordinator;
+        auto captureDevice = g_winrtDevice;
+        g_captureExecutor = std::make_unique<spatial::discovery::BoundedAttemptExecutor>(
+            CAPTURE_EXECUTOR_WORKERS,
+            [captureDevice, coordinator](HWND hwnd)
+            {
+                CaptureWindowOnWorker(hwnd, captureDevice, coordinator);
+            },
+            [coordinator](HWND hwnd, HRESULT error)
+            {
+                const size_t attemptNumber = g_captureAttemptSequence.fetch_add(1) + 1;
+                spatial::diagnostics::Log(L"capture.failure",
+                    L"attempt=" + std::to_wstring(attemptNumber) +
+                    L" hwnd=" + spatial::diagnostics::HexHandle(hwnd) +
+                    L" stage=bounded_worker HRESULT=" +
+                    spatial::diagnostics::HexHRESULT(error) +
+                    L" action=skip_and_continue");
+                CaptureCompletion failed;
+                failed.hwnd = hwnd;
+                failed.attemptNumber = attemptNumber;
+                failed.result = { spatial::discovery::AttemptStatus::Failed, error };
+                QueueCaptureCompletion(coordinator, std::move(failed));
+            },
+            []
+            {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                spatial::diagnostics::Log(L"capture.worker",
+                    L"thread_id=" + std::to_wstring(GetCurrentThreadId()) +
+                    L" apartment=MTA lifecycle=started_long_lived");
+            },
+            []
+            {
+                spatial::diagnostics::Log(L"capture.worker",
+                    L"thread_id=" + std::to_wstring(GetCurrentThreadId()) +
+                    L" lifecycle=stopping");
+                winrt::uninit_apartment();
+            });
+    }
     g_diag = {};
     g_captureAttemptSequence = 0;
+    g_activeCaptureInitializations = 0;
+    g_peakCaptureInitializations = 0;
     g_captureScheduled.clear();
     g_capturePending.clear();
     g_discoveryInFlight = false;
@@ -6285,6 +7005,12 @@ int RunCanvasApp()
     g_initialDiscoveryCompleted = false;
     g_startupIssueReported = false;
     g_hungAttemptsLogged = false;
+    g_monitorProbe = {};
+    g_controlWindowProbe = {};
+    g_controlWindowProbeHwnd = nullptr;
+    g_probesCompleted = false;
+    g_probesCompletedTick = 0;
+    g_probeSummaryShown = false;
 
     // M73 Slice 3: Spaces yüklendiyse aktif tuvalın kendi kamerası öncelikli
     if (g_spacesLoaded && g_activeSpace < (int)g_spaces.size()
@@ -6360,6 +7086,7 @@ int RunCanvasApp()
         // M3: yaşam döngüsü + kamera animasyonu
         size_t tilesBefore = g_tiles.size();
         DrainDiscoveryCompletions();
+        DrainProbeCompletions();
         DrainCaptureCompletions();
         SweepDeadTiles();
         AdoptNewWindows();
@@ -6487,7 +7214,7 @@ int RunCanvasApp()
         }
         MaybeLogHungCaptureAttempts();
         MaybeReportStartupIssue();
-        MaybeWarnNoFrames();
+        MaybeShowDiagnosticSummary();
         if (dirty)
             Render();
         else
@@ -6502,11 +7229,13 @@ done:
     if (g_captureCoordinator)
     {
         g_captureCoordinator->closing = true;
+        if (g_captureExecutor) g_captureExecutor->Stop(false);
         std::deque<CaptureCompletion> abandoned;
         {
             std::lock_guard lock(g_captureCoordinator->mutex);
             abandoned.swap(g_captureCoordinator->captures);
             g_captureCoordinator->discoveries.clear();
+            g_captureCoordinator->probes.clear();
         }
         for (auto& completion : abandoned) CloseCaptureResources(completion.tile);
     }

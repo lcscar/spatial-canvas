@@ -2,7 +2,9 @@
 
 #include <windows.h>
 #include <functional>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace spatial::discovery
@@ -84,11 +86,35 @@ namespace spatial::discovery
         const CaptureStartupStep& optionalConfiguration,
         const CaptureStartupStep& startCapture);
 
-    // Starts every HWND on an independent worker and returns without waiting for
-    // capture setup. A worker that blocks inside an OS API therefore cannot hold
-    // the UI thread or prevent later HWNDs from being dispatched.
-    DispatchSummary DispatchWindowAttemptsIndependently(
-        const std::vector<HWND>& windows,
-        const IndependentAttempt& attempt,
-        const DispatchFailure& failure);
+    // Small, long-lived executor used by the capture engine. Each worker processes
+    // HWNDs sequentially and keeps its COM/WinRT apartment alive between attempts.
+    // With two workers, one blocked OS call cannot hold the UI or stop the other
+    // worker from processing every later candidate. No thread is terminated.
+    class BoundedAttemptExecutor
+    {
+    public:
+        using WorkerLifecycle = std::function<void()>;
+
+        BoundedAttemptExecutor(size_t workerCount,
+            IndependentAttempt attempt,
+            DispatchFailure failure,
+            WorkerLifecycle workerStart = {},
+            WorkerLifecycle workerStop = {});
+        ~BoundedAttemptExecutor();
+
+        BoundedAttemptExecutor(const BoundedAttemptExecutor&) = delete;
+        BoundedAttemptExecutor& operator=(const BoundedAttemptExecutor&) = delete;
+
+        DispatchSummary Submit(const std::vector<HWND>& windows);
+        void Stop(bool waitForWorkers);
+        size_t WorkerCount() const noexcept;
+        size_t ActiveWorkers() const noexcept;
+        size_t PeakActiveWorkers() const noexcept;
+
+    private:
+        struct State;
+        std::shared_ptr<State> state_;
+        std::vector<std::thread> workers_;
+        bool stopped_ = false;
+    };
 }

@@ -83,9 +83,15 @@ required_runtime = {
     "privacy-safe title metadata": (runtime_text, 'L" title_length="'),
     "broad discovery evaluator": (discovery, "WindowDecision EvaluateWindow"),
     "per-HWND failure isolation": (discovery, "ProcessWindowAttempts"),
-    "independent capture workers": (
-        discovery, "DispatchWindowAttemptsIndependently"),
+    "bounded long-lived capture executor": (
+        discovery, "BoundedAttemptExecutor::Submit"),
     "frame-arrival registration": (canvas, ".FrameArrived("),
+    "callback-direct frame retrieval": (canvas, "sender.TryGetNextFrame()"),
+    "monitor control probe": (canvas, "CreateForMonitor("),
+    "control-window probe remains unparked": (
+        canvas, "parked=false selection_is_prioritization_only=true"),
+    "D3D multithread audit": (canvas, "GetMultithreadProtected()"),
+    "human-readable RCA summary": (canvas, "Capture RCA summary"),
     "unlimited capture dispatch": (canvas, "capture_limit=none"),
     "EnumDesktopWindows fallback": (runtime_text, "EnumDesktopWindows("),
     "intentional global mouse hook preserved": (
@@ -111,6 +117,9 @@ for needle in (
 
 if "GetWindowText" in diagnostics:
     errors.append("PRIVACY: Diagnostics.cpp must never obtain window-title text")
+
+if "DispatchWindowAttemptsIndependently" in runtime_text:
+    errors.append("THREADING: detached-per-HWND capture dispatch must remain removed")
 
 show_canvas = canvas.find("ShowWindow(g_hwnd, SW_SHOW)")
 start_discovery = canvas.find("StartDiscoveryAsync(true)")
@@ -139,7 +148,8 @@ print(" - no HKCU Run/registry persistence path")
 print(" - no named-pipe server, services, tasks, or injection APIs")
 print(" - no screenshot/frame export path")
 print(" - debug log is executable-adjacent UTF-8 and title-content safe")
-print(" - broad discovery, independent per-HWND workers, and no capture ceiling are enforced")
+print(" - broad discovery, bounded long-lived capture workers, and no capture ceiling are enforced")
+print(" - FrameArrived callback retrieval, monitor/window probes, and RCA summary are present")
 print(" - optional WGC session properties are absent from the startup path")
 print(" - successful Release builds publish only SpatialCanvas.exe to release/exe-only")
 print(" - manifest explicitly uses asInvoker / uiAccess=false")

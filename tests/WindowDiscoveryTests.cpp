@@ -146,8 +146,9 @@ int main()
             std::atomic<int> finished = 0;
         };
         auto state = std::make_shared<AsyncState>();
-        auto before = std::chrono::steady_clock::now();
-        auto dispatch = DispatchWindowAttemptsIndependently(windows,
+        std::atomic<int> workerStarts = 0;
+        std::atomic<int> workerStops = 0;
+        BoundedAttemptExecutor executor(2,
             [state](HWND hwnd) {
                 ++state->started;
                 state->changed.notify_all();
@@ -162,7 +163,11 @@ int main()
             [state](HWND, HRESULT) {
                 ++state->finished;
                 state->changed.notify_all();
-            });
+            },
+            [&workerStarts] { ++workerStarts; },
+            [&workerStops] { ++workerStops; });
+        auto before = std::chrono::steady_clock::now();
+        auto dispatch = executor.Submit(windows);
         auto dispatchElapsed = std::chrono::steady_clock::now() - before;
 
         {
@@ -173,11 +178,13 @@ int main()
         }
         Expect(dispatch.discovered == 24 && dispatch.dispatched == 24 &&
             dispatch.dispatchFailures == 0,
-            "every discovered candidate is dispatched without a 12/16 ceiling");
+            "every discovered candidate enters the bounded queue without a 12/16 ceiling");
         Expect(state->started.load() == 24,
-            "a blocked candidate cannot prevent later candidates from starting");
+            "one blocked candidate cannot prevent the other long-lived worker from attempting every later candidate");
         Expect(dispatchElapsed < std::chrono::seconds(2),
             "dispatch returns before capture attempts complete so UI startup is independent");
+        Expect(executor.WorkerCount() == 2,
+            "capture initialization uses a small fixed worker count");
 
         {
             std::lock_guard lock(state->mutex);
@@ -191,7 +198,12 @@ int main()
             });
         }
         Expect(state->finished.load() == 24,
-            "all independently dispatched candidates eventually complete when unblocked");
+            "all queued candidates eventually complete when the blocked attempt is released");
+        Expect(executor.PeakActiveWorkers() <= 2,
+            "capture initialization concurrency never exceeds the configured bound");
+        executor.Stop(true);
+        Expect(workerStarts.load() == 2 && workerStops.load() == 2,
+            "capture worker execution contexts remain alive across queued attempts and stop cleanly");
     }
 
     if (failures != 0)
