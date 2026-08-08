@@ -5567,8 +5567,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             g_updateAvail = true;
             ShowToast(TL(L"New version ", L"Yeni sürüm ") + v +
-                TL(L" available — github.com/13auth/spatial-canvas",
-                   L" mevcut — github.com/13auth/spatial-canvas"));
+                TL(L" available", L" mevcut"));
         }
         return 0;
     }

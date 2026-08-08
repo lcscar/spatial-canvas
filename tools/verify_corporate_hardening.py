@@ -50,6 +50,7 @@ forbidden_case_insensitive = {
     "Winsock library": "ws2_32.lib",
     "upstream update host": "raw.githubusercontent.com/13auth/spatial-canvas",
     "upstream release URL": "github.com/13auth/spatial-canvas/releases",
+    "upstream host reference in executable": "github.com/13auth/spatial-canvas",
     "scheduled-task launcher": "schtasks.exe",
 }
 
