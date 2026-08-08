@@ -2797,7 +2797,7 @@ static void LoadSettings()
     g_set.bgPreset = std::clamp(g_set.bgPreset, 0, 3); // M29
     g_set.canvasSpan = std::clamp(g_set.canvasSpan, 0, 1);
     g_set.wheelMod = std::clamp(g_set.wheelMod, 0, 4);
-    g_set.autostart = QueryAutostart(); // kaynak doğruluk: registry
+    g_set.autostart = false; // Corporate-safe: autostart permanently disabled
 }
 
 static void SaveSettings()

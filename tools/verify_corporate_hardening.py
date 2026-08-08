@@ -19,6 +19,8 @@ forbidden = {
     "registry write": "RegSetValueExW(",
     "registry delete": "RegDeleteValueW(",
     "named pipe server": "CreateNamedPipeW(",
+    "autostart query symbol": "QueryAutostart",
+    "autostart apply symbol": "ApplyAutostart",
     "persisted window-title capture": "GetWindowTextW(t.source, title, 256);",
 }
 
